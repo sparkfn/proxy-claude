@@ -155,34 +155,47 @@ if [ -f "$DIR/.env" ]; then
     fi
 fi
 
-# --- Build the alias ---
+# --- Build the function ---
 
-ALIAS_LINE="alias ${ALIAS_NAME}='ANTHROPIC_BASE_URL=\"http://localhost:${PORT}\" ANTHROPIC_MODEL=\"${MODEL}\" ANTHROPIC_API_KEY=\"${MASTER_KEY}\" CLAUDE_CODE_DISABLE_1M_CONTEXT=1 claude'"
-COMMENT="# Claude Code via LiteLLM Proxy (${MODEL})"
+# Use a function instead of alias so we can properly isolate env vars.
+# env -i starts clean, then we pass only what's needed + PATH/HOME/TERM.
+FUNC_BLOCK=$(cat <<FUNCEOF
+# Claude Code via LiteLLM Proxy (${MODEL})
+${ALIAS_NAME}() {
+  ANTHROPIC_BASE_URL="http://localhost:${PORT}" \\
+  ANTHROPIC_MODEL="${MODEL}" \\
+  ANTHROPIC_API_KEY="${MASTER_KEY}" \\
+  CLAUDE_CODE_DISABLE_1M_CONTEXT=1 \\
+  CLAUDE_CODE_SKIP_OAUTH=1 \\
+  claude "\$@"
+}
+FUNCEOF
+)
 
-# --- Check for existing alias ---
+MARKER="# Claude Code via LiteLLM Proxy (${ALIAS_NAME})"
 
-if grep -q "alias ${ALIAS_NAME}=" "$PROFILE" 2>/dev/null; then
-    echo "  ⚠ Alias '${ALIAS_NAME}' already exists in $PROFILE."
+# --- Check for existing function ---
+
+if grep -q "^${ALIAS_NAME}()" "$PROFILE" 2>/dev/null || grep -q "alias ${ALIAS_NAME}=" "$PROFILE" 2>/dev/null; then
+    echo "  ⚠ '${ALIAS_NAME}' already exists in $PROFILE."
     read -p "  Overwrite? [y/N]: " OVERWRITE
     if [[ "${OVERWRITE,,}" != "y" ]]; then
         echo "  Cancelled."
         exit 0
     fi
-    # Remove old alias line and its comment
-    sed -i.bak "/# Claude Code via LiteLLM Proxy.*${ALIAS_NAME}\|alias ${ALIAS_NAME}=/d" "$PROFILE"
-    echo "  Removed old alias."
+    # Remove old function/alias block
+    sed -i.bak "/# Claude Code via LiteLLM Proxy.*${ALIAS_NAME}/d; /^${ALIAS_NAME}()/,/^}/d; /alias ${ALIAS_NAME}=/d" "$PROFILE"
+    echo "  Removed old entry."
 fi
 
 # --- Write to profile ---
 
 echo "" >> "$PROFILE"
-echo "$COMMENT" >> "$PROFILE"
-echo "$ALIAS_LINE" >> "$PROFILE"
+echo "$FUNC_BLOCK" >> "$PROFILE"
 
 echo "  ✓ Added to $PROFILE:"
 echo ""
-echo "    $ALIAS_LINE"
+echo "$FUNC_BLOCK" | sed 's/^/    /'
 echo ""
 
 # --- Source it ---
