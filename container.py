@@ -1,9 +1,11 @@
+import logging
 import os
 import subprocess
 import sys
 import time
 
 DIR = os.path.dirname(os.path.abspath(__file__))
+log = logging.getLogger("litellm-cli.container")
 CONTAINER_NAME = "litellm-proxy"
 
 # Cache compose command after first detection
@@ -41,6 +43,7 @@ def _compose_cmd():
 def _run(args, capture=False, stream=False):
     """Run a docker compose command from the project directory."""
     cmd = _compose_cmd() + args
+    log.debug("Running: %s", " ".join(cmd))
     try:
         if stream:
             proc = subprocess.Popen(cmd, cwd=DIR)
@@ -92,6 +95,7 @@ def down():
 def restart():
     """Recreate container to pick up .env and config changes."""
     _check_docker()
+    log.debug("Recreating container with --force-recreate to pick up env/config changes")
     ok, _ = _run(["up", "-d", "--force-recreate"])
     return ok
 

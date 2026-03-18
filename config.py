@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import stat
@@ -5,6 +6,7 @@ import tempfile
 import yaml
 
 DIR = os.path.dirname(os.path.abspath(__file__))
+log = logging.getLogger("litellm-cli.config")
 CONFIG_PATH = os.path.join(DIR, "litellm_config.yaml")
 CONFIG_BACKUP = CONFIG_PATH + ".bak"
 ENV_PATH = os.path.join(DIR, ".env")
@@ -46,9 +48,11 @@ def _save_yaml(data):
     """Backup then write litellm_config.yaml atomically."""
     if os.path.exists(CONFIG_PATH):
         shutil.copy2(CONFIG_PATH, CONFIG_BACKUP)
+        log.debug("Backed up config to %s", CONFIG_BACKUP)
     _atomic_write(CONFIG_PATH, lambda f: yaml.dump(
         data, f, default_flow_style=False, sort_keys=False
     ))
+    log.debug("Wrote config to %s", CONFIG_PATH)
 
 
 def list_models():
@@ -171,6 +175,7 @@ def get_env(key):
 
 def set_env(key, value):
     """Set an env var in .env. Updates existing or appends."""
+    log.debug("Setting env var: %s", key)
     lines = _read_env_lines()
     found = False
     new_lines = []
@@ -192,6 +197,7 @@ def set_env(key, value):
 
 def remove_env(key):
     """Comment out an env var in .env."""
+    log.debug("Removing env var: %s", key)
     lines = _read_env_lines()
     new_lines = []
     for line in lines:

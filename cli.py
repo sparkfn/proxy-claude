@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
+import logging
 import sys
 import os
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 PORT = 2555
 
+log = logging.getLogger("litellm-cli")
+
+
+def _setup_logging(verbose=False):
+    level = logging.DEBUG if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="  [%(levelname)s] %(name)s: %(message)s",
+    )
+
 
 def show_help():
+    name = os.path.basename(sys.argv[0]) if sys.argv[0] else "./litellm.sh"
     print("LiteLLM Gateway CLI")
-    print("Usage: ./litellm.sh [COMMAND]")
+    print(f"Usage: {name} [COMMAND] [OPTIONS]")
     print()
     print("Lifecycle:")
     print("  up              Start the proxy container")
@@ -25,6 +37,9 @@ def show_help():
     print("Auth:")
     print("  login [provider]  Authenticate with a provider")
     print("                    No arg: show auth status for all providers")
+    print()
+    print("Options:")
+    print("  --verbose, -v   Enable debug logging")
 
 
 def cmd_status():
@@ -133,6 +148,14 @@ def cmd_login(provider_name=None):
     else:
         print(f"\n  ✗ {msg}")
         sys.exit(1)
+
+
+def _print_restart_failure():
+    """Print container failure message with backup info if available."""
+    import config
+    print(f"  ✗ Container failed to start. Check './litellm.sh logs' for details.")
+    if os.path.exists(config.CONFIG_BACKUP):
+        print(f"    Your previous config was backed up to litellm_config.yaml.bak")
 
 
 def cmd_add():
@@ -265,9 +288,9 @@ def _add_provider_first():
         return
 
     print(f"\n  Restarting container...")
+    log.debug("Restarting after adding models: %s", added)
     if not container.restart():
-        print(f"  ✗ Container restart failed. Check './litellm.sh logs' for details.")
-        print(f"    Your previous config was backed up to litellm_config.yaml.bak")
+        _print_restart_failure()
         sys.exit(1)
     if container.wait_healthy():
         status, msg = provider.validate()
@@ -277,8 +300,7 @@ def _add_provider_first():
             print(f"  ⚠ Container is running. Added: {', '.join(added)}")
             print(f"    Auth check: {msg}")
     else:
-        print(f"  ✗ Container failed to start. Check './litellm.sh logs' for details.")
-        print(f"    Your previous config was backed up to litellm_config.yaml.bak")
+        _print_restart_failure()
         sys.exit(1)
 
 
@@ -344,11 +366,15 @@ def _add_model_first():
                 print(f"\n  ✗ {msg}")
                 sys.exit(1)
             print(f"  ✓ {msg}")
+        else:
+            # Already authenticated — detect which auth type is active
+            auth_type = provider.detect_auth_type()
 
-            if auth_type and hasattr(provider, "get_model_string"):
-                new_model_str = provider.get_model_string(alias, auth_type)
-                if new_model_str:
-                    model_str = new_model_str
+        # Resolve model string based on auth type
+        if auth_type and hasattr(provider, "get_model_string"):
+            new_model_str = provider.get_model_string(alias, auth_type)
+            if new_model_str:
+                model_str = new_model_str
 
     existing_aliases = [m["alias"] for m in config.list_models()]
     final_alias = alias
@@ -374,9 +400,9 @@ def _add_model_first():
     print(f"  ✓ {msg}")
 
     print(f"\n  Restarting container...")
+    log.debug("Restarting after adding model: %s", final_alias)
     if not container.restart():
-        print(f"  ✗ Container restart failed. Check './litellm.sh logs' for details.")
-        print(f"    Config backed up to litellm_config.yaml.bak")
+        _print_restart_failure()
         sys.exit(1)
     if container.wait_healthy():
         status, msg = provider.validate()
@@ -386,8 +412,7 @@ def _add_model_first():
             print(f"  ⚠ Container is running with '{final_alias}'")
             print(f"    Auth check: {msg}")
     else:
-        print(f"  ✗ Container failed to start. Check './litellm.sh logs' for details.")
-        print(f"    Config backed up to litellm_config.yaml.bak")
+        _print_restart_failure()
         sys.exit(1)
 
 
@@ -455,27 +480,37 @@ def cmd_remove():
                         print(f"  ✓ Cleaned up env vars.")
 
     print(f"\n  Restarting container...")
+    log.debug("Restarting after removing models")
     if not container.restart():
-        print(f"  ✗ Container restart failed. Check './litellm.sh logs' for details.")
+        _print_restart_failure()
         sys.exit(1)
     if container.wait_healthy():
         print(f"  ✓ Container is running.")
     else:
-        print(f"  ✗ Container failed to start. Check './litellm.sh logs' for details.")
+        _print_restart_failure()
         sys.exit(1)
 
 
 def main():
     import config
-    config._ensure_env()
 
     args = sys.argv[1:]
+
+    # Parse --verbose / -v from anywhere in args
+    verbose = "--verbose" in args or "-v" in args
+    args = [a for a in args if a not in ("--verbose", "-v")]
+
+    _setup_logging(verbose)
+    log.debug("CLI started with args: %s", args)
+
+    config._ensure_env()
 
     if not args or args[0] in ("help", "-h", "--help"):
         show_help()
         return
 
     cmd = args[0]
+    log.debug("Executing command: %s", cmd)
 
     if cmd == "up":
         import container

@@ -1,3 +1,4 @@
+import logging
 import re
 import sys
 import time
@@ -8,6 +9,8 @@ import requests
 import config
 import container
 from providers.base import BaseProvider, AuthStatus
+
+log = logging.getLogger("litellm-cli.openai")
 
 
 class OpenAIProvider(BaseProvider):
@@ -45,8 +48,10 @@ class OpenAIProvider(BaseProvider):
         # Check API key first
         api_key = config.get_env("OPENAI_API_KEY")
         if api_key:
+            log.debug("OPENAI_API_KEY found, validating via API")
             return self._validate_api_key(api_key)
         # Check browser OAuth via container logs
+        log.debug("No API key, checking browser OAuth via container logs")
         return self._validate_browser()
 
     def _validate_api_key(self, api_key):
@@ -74,7 +79,9 @@ class OpenAIProvider(BaseProvider):
         logs = container.get_logs_tail(200)
         # Match specific LiteLLM auth success patterns, not bare "authenticated"
         if re.search(r"(?i)(successfully authenticated|chatgpt.*auth|session.*authenticated)", logs):
+            log.debug("Browser OAuth auth pattern found in logs")
             return AuthStatus.OK, "Authenticated via browser OAuth"
+        log.debug("No auth pattern found in last 200 log lines")
         return AuthStatus.NOT_CONFIGURED, "Not authenticated with OpenAI"
 
     def login(self, auth_type="browser_oauth"):
