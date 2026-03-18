@@ -119,15 +119,29 @@ class OpenAIProvider(BaseProvider):
         # Capture timestamp before looking for URL
         since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        print("\n  Waiting for login URL from container...")
+        print("\n  Waiting for login instructions from container...")
         login_url = None
+        device_code = None
         for attempt in range(30):  # 30 * 2s = 60s to find URL
             logs = container.get_logs_since(since)
-            # Match OpenAI device code URLs specifically — not generic docs/GitHub URLs
-            urls = re.findall(r'https?://(?:login\.chatgpt\.com|auth0\.openai\.com|chat\.openai\.com)[^\s"\']*', logs)
+
+            # Also check recent logs if --since returns nothing (timestamp drift)
+            if not logs.strip():
+                logs = container.get_logs_tail(50)
+
+            # Match OpenAI auth URLs
+            urls = re.findall(
+                r'https?://(?:auth\.openai\.com|login\.chatgpt\.com|auth0\.openai\.com|chat\.openai\.com)[^\s"\']*',
+                logs
+            )
             if not urls:
-                # Fallback: match any URL with device_code or user_code params
-                urls = re.findall(r'https?://[^\s"\']*(?:device_code|user_code|device)[^\s"\']*', logs)
+                urls = re.findall(r'https?://[^\s"\']*(?:/codex/|/device|device_code|user_code)[^\s"\']*', logs)
+
+            # Extract device code (e.g. "Enter code: 38KX-M5UES")
+            code_match = re.search(r'(?:Enter code|enter.*code)[:\s]+([A-Z0-9]{4,}-[A-Z0-9]{4,})', logs)
+            if code_match:
+                device_code = code_match.group(1)
+
             if urls:
                 login_url = urls[-1]
                 break
@@ -144,12 +158,11 @@ class OpenAIProvider(BaseProvider):
         print(f"  ┌─────────────────────────────────────────────────────┐")
         print(f"  │  OpenAI Login Required                             │")
         print(f"  │                                                     │")
-        print(f"  │  Open this URL in your browser:                     │")
-        print(f"  │  {login_url[:50]:<50} │")
-        if len(login_url) > 50:
-            print(f"  │  {login_url[50:100]:<50} │")
+        print(f"  │  1) Open:  {login_url:<42} │")
+        if device_code:
+            print(f"  │  2) Enter code:  {device_code:<36} │")
         print(f"  │                                                     │")
-        print(f"  │  Waiting for browser login... (timeout: 5 min)      │")
+        print(f"  │  Waiting for login... (timeout: 5 min)              │")
         print(f"  └─────────────────────────────────────────────────────┘")
         print()
 

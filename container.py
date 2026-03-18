@@ -8,6 +8,15 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("litellm-cli.container")
 CONTAINER_NAME = "litellm-proxy"
 
+
+def _docker_bin():
+    """Find the real docker binary, bypassing shell aliases/proxies (e.g. rtk)."""
+    for path in ["/usr/local/bin/docker", "/usr/bin/docker",
+                 os.path.expanduser("~/.docker/bin/docker")]:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return "docker"
+
 # Cache compose command after first detection
 _cached_compose_cmd = None
 
@@ -119,8 +128,10 @@ def logs(follow=True):
 def get_logs_since(timestamp):
     """Get container logs since a timestamp (RFC3339 format). Returns log text."""
     _check_docker()
+    docker = _docker_bin()
+    log.debug("Reading logs since %s via %s", timestamp, docker)
     result = subprocess.run(
-        ["docker", "logs", CONTAINER_NAME, "--since", timestamp],
+        [docker, "logs", CONTAINER_NAME, "--since", timestamp],
         capture_output=True, text=True, cwd=DIR,
     )
     return result.stdout + result.stderr
@@ -128,8 +139,10 @@ def get_logs_since(timestamp):
 
 def get_logs_tail(lines=200):
     """Get last N lines of container logs. Returns log text."""
+    docker = _docker_bin()
+    log.debug("Reading last %d log lines via %s", lines, docker)
     result = subprocess.run(
-        ["docker", "logs", CONTAINER_NAME, "--tail", str(lines)],
+        [docker, "logs", CONTAINER_NAME, "--tail", str(lines)],
         capture_output=True, text=True, cwd=DIR,
     )
     return result.stdout + result.stderr
