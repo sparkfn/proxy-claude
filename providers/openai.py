@@ -123,7 +123,11 @@ class OpenAIProvider(BaseProvider):
         login_url = None
         for attempt in range(30):  # 30 * 2s = 60s to find URL
             logs = container.get_logs_since(since)
-            urls = re.findall(r'https?://[^\s"\']+(?:login|auth|device|verify)[^\s"\']*', logs)
+            # Match OpenAI device code URLs specifically — not generic docs/GitHub URLs
+            urls = re.findall(r'https?://(?:login\.chatgpt\.com|auth0\.openai\.com|chat\.openai\.com)[^\s"\']*', logs)
+            if not urls:
+                # Fallback: match any URL with device_code or user_code params
+                urls = re.findall(r'https?://[^\s"\']*(?:device_code|user_code|device)[^\s"\']*', logs)
             if urls:
                 login_url = urls[-1]
                 break

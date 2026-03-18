@@ -1,6 +1,6 @@
 import requests
 import config
-from providers.base import BaseProvider, AuthStatus
+from providers.base import BaseProvider, AuthStatus, is_placeholder
 
 
 class AlibabaProvider(BaseProvider):
@@ -18,7 +18,7 @@ class AlibabaProvider(BaseProvider):
 
     def validate(self):
         api_key = config.get_env("DASHSCOPE_API_KEY")
-        if not api_key or api_key == "your-alibaba-key-here":
+        if not api_key or is_placeholder(api_key):
             return AuthStatus.NOT_CONFIGURED, "DASHSCOPE_API_KEY not set"
         try:
             resp = requests.get(

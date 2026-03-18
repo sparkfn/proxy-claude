@@ -2,6 +2,20 @@ from abc import ABC, abstractmethod
 from enum import Enum
 
 
+def is_placeholder(value):
+    """Detect common placeholder values from .env.example files."""
+    if not value:
+        return True
+    v = value.lower().strip()
+    return (
+        v.startswith("your-") or
+        v.startswith("your_") or
+        v.endswith("-here") or
+        v.endswith("_here") or
+        v in ("changeme", "replace-me", "xxx", "todo", "placeholder")
+    )
+
+
 class AuthStatus(Enum):
     OK = "ok"
     NOT_CONFIGURED = "not_configured"

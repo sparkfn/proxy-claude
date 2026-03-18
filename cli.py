@@ -260,10 +260,9 @@ def _add_provider_first():
         sys.exit(1)
 
     added = []
+    existing_aliases = [m["alias"] for m in config.list_models()]
     for alias in selected:
         model_str = catalog[alias]
-        existing = config.list_models()
-        existing_aliases = [m["alias"] for m in existing]
         final_alias = alias
         if alias in existing_aliases:
             print(f"\n  Alias '{alias}' already exists.")
@@ -279,6 +278,7 @@ def _add_provider_first():
         ok, msg = config.add_model(final_alias, model_str, extra)
         if ok:
             added.append(final_alias)
+            existing_aliases.append(final_alias)
             print(f"  ✓ {msg}")
         else:
             print(f"  ✗ {msg}")

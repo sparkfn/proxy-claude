@@ -69,7 +69,7 @@ def list_models():
 
 
 def _provider_from_model(model_str):
-    """Map litellm model prefix to provider name."""
+    """Map litellm model prefix to provider name. Returns None for unknown."""
     prefix = model_str.split("/")[0] if "/" in model_str else ""
     mapping = {
         "chatgpt": "openai",
@@ -77,7 +77,7 @@ def _provider_from_model(model_str):
         "dashscope": "alibaba",
         "ollama": "ollama",
     }
-    return mapping.get(prefix, prefix)
+    return mapping.get(prefix)
 
 
 def add_model(alias, litellm_model, extra_params=None):
