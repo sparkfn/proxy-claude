@@ -4,18 +4,37 @@ import sys
 import time
 
 DIR = os.path.dirname(os.path.abspath(__file__))
+CONTAINER_NAME = "litellm-proxy"
+
+# Cache compose command after first detection
+_cached_compose_cmd = None
 
 
 def _compose_cmd():
-    """Return the docker compose command as a list. Tries 'docker compose' (v2) first."""
+    """Return the docker compose command as a list. Cached after first call."""
+    global _cached_compose_cmd
+    if _cached_compose_cmd is not None:
+        return _cached_compose_cmd
     try:
         result = subprocess.run(
             ["docker", "compose", "version"], capture_output=True, text=True
         )
         if result.returncode == 0:
-            return ["docker", "compose"]
+            _cached_compose_cmd = ["docker", "compose"]
+            return _cached_compose_cmd
     except FileNotFoundError:
         pass
+    # Verify docker-compose exists before caching
+    try:
+        result = subprocess.run(
+            ["docker-compose", "version"], capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            _cached_compose_cmd = ["docker-compose"]
+            return _cached_compose_cmd
+    except FileNotFoundError:
+        pass
+    # Neither found — return docker-compose and let _run handle the error
     return ["docker-compose"]
 
 
@@ -71,8 +90,9 @@ def down():
 
 
 def restart():
+    """Recreate container to pick up .env and config changes."""
     _check_docker()
-    ok, _ = _run(["restart"])
+    ok, _ = _run(["up", "-d", "--force-recreate"])
     return ok
 
 
@@ -96,7 +116,16 @@ def get_logs_since(timestamp):
     """Get container logs since a timestamp (RFC3339 format). Returns log text."""
     _check_docker()
     result = subprocess.run(
-        ["docker", "logs", "litellm-proxy", "--since", timestamp],
+        ["docker", "logs", CONTAINER_NAME, "--since", timestamp],
+        capture_output=True, text=True, cwd=DIR,
+    )
+    return result.stdout + result.stderr
+
+
+def get_logs_tail(lines=200):
+    """Get last N lines of container logs. Returns log text."""
+    result = subprocess.run(
+        ["docker", "logs", CONTAINER_NAME, "--tail", str(lines)],
         capture_output=True, text=True, cwd=DIR,
     )
     return result.stdout + result.stderr
@@ -105,8 +134,12 @@ def get_logs_since(timestamp):
 def wait_healthy(timeout=30):
     """Poll until container is up or timeout. Returns True if healthy."""
     for _ in range(timeout):
-        running, _ = status()
-        if running:
-            return True
+        try:
+            ok, output = _run(["ps"], capture=True)
+            is_running = "Up" in output or "running" in output.lower()
+            if is_running:
+                return True
+        except SystemExit:
+            pass  # Docker temporarily unavailable, keep polling
         time.sleep(1)
     return False

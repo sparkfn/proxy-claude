@@ -1,5 +1,4 @@
 import re
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -72,12 +71,9 @@ class OpenAIProvider(BaseProvider):
         running, _ = container.status()
         if not running:
             return AuthStatus.NOT_CONFIGURED, "Container not running — cannot check browser auth"
-        result = subprocess.run(
-            ["docker", "logs", "litellm-proxy", "--tail", "200"],
-            capture_output=True, text=True,
-        )
-        logs = result.stdout + result.stderr
-        if re.search(r"(?i)authenticated", logs):
+        logs = container.get_logs_tail(200)
+        # Match specific LiteLLM auth success patterns, not bare "authenticated"
+        if re.search(r"(?i)(successfully authenticated|chatgpt.*auth|session.*authenticated)", logs):
             return AuthStatus.OK, "Authenticated via browser OAuth"
         return AuthStatus.NOT_CONFIGURED, "Not authenticated with OpenAI"
 

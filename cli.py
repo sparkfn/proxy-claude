@@ -43,11 +43,15 @@ def cmd_status():
         print("Models:     (none configured)")
         return
 
+    # Cache validation per provider to avoid redundant network calls
+    auth_cache = {}
     print("Models:")
     for m in models:
         provider = providers.get_provider(m["provider"])
         if provider and running:
-            auth_status, _ = provider.validate()
+            if m["provider"] not in auth_cache:
+                auth_cache[m["provider"]] = provider.validate()
+            auth_status, _ = auth_cache[m["provider"]]
             if auth_status.value == "ok":
                 icon = "✓"
                 label = "authenticated" if m["provider"] != "ollama" else "reachable"
@@ -261,7 +265,10 @@ def _add_provider_first():
         return
 
     print(f"\n  Restarting container...")
-    container.restart()
+    if not container.restart():
+        print(f"  ✗ Container restart failed. Check './litellm.sh logs' for details.")
+        print(f"    Your previous config was backed up to litellm_config.yaml.bak")
+        sys.exit(1)
     if container.wait_healthy():
         status, msg = provider.validate()
         if status.value == "ok":
@@ -286,9 +293,10 @@ def _add_model_first():
             ollama_models = p.discover_models()
             if not ollama_models:
                 print("  (Ollama not running — skipping its models)")
-            for alias, model_str in ollama_models.items():
-                key = f"{alias} ({p.display_name})"
-                combined[key] = (p, alias, model_str)
+            else:
+                for alias, model_str in ollama_models.items():
+                    key = f"{alias} ({p.display_name})"
+                    combined[key] = (p, alias, model_str)
         else:
             for alias, model_str in p.models.items():
                 key = f"{alias} ({p.display_name})"
@@ -366,7 +374,10 @@ def _add_model_first():
     print(f"  ✓ {msg}")
 
     print(f"\n  Restarting container...")
-    container.restart()
+    if not container.restart():
+        print(f"  ✗ Container restart failed. Check './litellm.sh logs' for details.")
+        print(f"    Config backed up to litellm_config.yaml.bak")
+        sys.exit(1)
     if container.wait_healthy():
         status, msg = provider.validate()
         if status.value == "ok":
@@ -444,7 +455,9 @@ def cmd_remove():
                         print(f"  ✓ Cleaned up env vars.")
 
     print(f"\n  Restarting container...")
-    container.restart()
+    if not container.restart():
+        print(f"  ✗ Container restart failed. Check './litellm.sh logs' for details.")
+        sys.exit(1)
     if container.wait_healthy():
         print(f"  ✓ Container is running.")
     else:
@@ -466,13 +479,16 @@ def main():
 
     if cmd == "up":
         import container
-        container.up()
+        if not container.up():
+            sys.exit(1)
     elif cmd == "down":
         import container
-        container.down()
+        if not container.down():
+            sys.exit(1)
     elif cmd == "restart":
         import container
-        container.restart()
+        if not container.restart():
+            sys.exit(1)
     elif cmd == "status":
         cmd_status()
     elif cmd == "logs":

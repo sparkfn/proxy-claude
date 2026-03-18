@@ -1,5 +1,7 @@
 import os
 import shutil
+import stat
+import tempfile
 import yaml
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,19 +17,38 @@ def _load_yaml():
     """Load litellm_config.yaml, return full dict."""
     if not os.path.exists(CONFIG_PATH):
         return {"model_list": [], "general_settings": {}}
-    with open(CONFIG_PATH, "r") as f:
-        data = yaml.safe_load(f) or {}
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            data = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        print(f"Error: litellm_config.yaml is malformed: {e}")
+        if os.path.exists(CONFIG_BACKUP):
+            print(f"  A backup exists at litellm_config.yaml.bak")
+        raise SystemExit(1)
     if "model_list" not in data:
         data["model_list"] = []
     return data
 
 
+def _atomic_write(path, content_fn):
+    """Write to a temp file then rename atomically."""
+    fd, tmp_path = tempfile.mkstemp(dir=DIR, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            content_fn(f)
+        os.replace(tmp_path, path)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+
+
 def _save_yaml(data):
-    """Backup then write litellm_config.yaml. Preserves all top-level keys."""
+    """Backup then write litellm_config.yaml atomically."""
     if os.path.exists(CONFIG_PATH):
         shutil.copy2(CONFIG_PATH, CONFIG_BACKUP)
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    _atomic_write(CONFIG_PATH, lambda f: yaml.dump(
+        data, f, default_flow_style=False, sort_keys=False
+    ))
 
 
 def list_models():
@@ -101,12 +122,15 @@ def provider_has_models(provider_name):
 # --- .env helpers ---
 
 def _ensure_env():
-    """Ensure .env exists."""
+    """Ensure .env exists with restrictive permissions."""
     if not os.path.exists(ENV_PATH):
         if os.path.exists(ENV_EXAMPLE):
             shutil.copy2(ENV_EXAMPLE, ENV_PATH)
         else:
-            open(ENV_PATH, "w").close()
+            with open(ENV_PATH, "w") as f:
+                pass
+    # Ensure .env is only readable by owner (contains API keys)
+    os.chmod(ENV_PATH, stat.S_IRUSR | stat.S_IWUSR)
 
 
 def _read_env_lines():
@@ -117,11 +141,20 @@ def _read_env_lines():
 
 
 def _write_env_lines(lines):
-    """Backup then write .env lines."""
+    """Backup then write .env atomically with restrictive permissions."""
     if os.path.exists(ENV_PATH):
         shutil.copy2(ENV_PATH, ENV_BACKUP)
-    with open(ENV_PATH, "w") as f:
-        f.writelines(lines)
+    _atomic_write(ENV_PATH, lambda f: f.writelines(lines))
+    os.chmod(ENV_PATH, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _strip_quotes(value):
+    """Strip surrounding single or double quotes from a value."""
+    if len(value) >= 2:
+        if (value[0] == '"' and value[-1] == '"') or \
+           (value[0] == "'" and value[-1] == "'"):
+            return value[1:-1]
+    return value
 
 
 def get_env(key):
@@ -132,7 +165,7 @@ def get_env(key):
             continue
         k, _, v = stripped.partition("=")
         if k.strip() == key:
-            return v.strip()
+            return _strip_quotes(v.strip())
     return None
 
 
