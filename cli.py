@@ -119,15 +119,16 @@ def cmd_login(provider_name=None):
         sys.exit(1)
 
     status, msg = provider.validate()
-    if status.value == "ok":
-        print(f"  ✓ Already authenticated with {provider.display_name}. {msg}")
-        return
 
     auth_type = None
     if len(provider.auth_types) == 0:
-        print(f"  {provider.display_name} doesn't require authentication.")
+        # Provider manages its own auth (e.g. Ollama)
         ok, msg = provider.login()
         print(f"  {'✓' if ok else '✗'} {msg}")
+        return
+
+    if status.value == "ok":
+        print(f"  ✓ Already authenticated with {provider.display_name}. {msg}")
         return
     elif len(provider.auth_types) == 1:
         auth_type = provider.auth_types[0]
@@ -198,65 +199,96 @@ def _add_provider_first():
         print("  Invalid choice.")
         sys.exit(1)
 
-    auth_type = None
-    if provider.auth_types:
-        if len(provider.auth_types) == 1:
-            auth_type = provider.auth_types[0]
-        else:
-            print(f"\n  Auth method for {provider.display_name}:\n")
-            for i, at in enumerate(provider.auth_types, 1):
-                label = at.replace("_", " ").title()
-                print(f"    [{i}] {label}")
-            print()
-            at_choice = input("  Choose [1]: ").strip() or "1"
-            try:
-                auth_type = provider.auth_types[int(at_choice) - 1]
-            except (ValueError, IndexError):
-                print("  Invalid choice.")
-                sys.exit(1)
-
+    if provider.name == "ollama":
+        # --- Ollama: must be running locally ---
         status, msg = provider.validate()
         if status.value != "ok":
-            print(f"\n  Need to authenticate with {provider.display_name}.")
-            ok, msg = provider.login(auth_type)
-            if not ok:
-                print(f"\n  ✗ {msg}")
-                sys.exit(1)
-            print(f"  ✓ {msg}")
-
-    if provider.name == "ollama":
-        catalog = provider.discover_models()
-        if not catalog:
-            print("\n  ✗ Ollama is not running. Start it and try again.")
+            print(f"\n  ✗ {msg}")
             sys.exit(1)
+        catalog = provider.discover_models()
+
+        # --- Ollama model selection (with manual input + pull) ---
+        aliases = list(catalog.keys())
+        if aliases:
+            print(f"\n  Available Ollama models:\n")
+            for i, alias in enumerate(aliases, 1):
+                print(f"    [{i}] {alias}")
+            print(f"    [m] Enter model name manually")
+            print(f"    [a] All")
+            print()
+            model_choice = input("  Choose (comma-separated, e.g. 1,3): ").strip()
+
+            if model_choice.lower() == "m":
+                selected, catalog = _ollama_manual_input(provider, catalog)
+            elif model_choice.lower() == "a":
+                selected = aliases
+            else:
+                selected = []
+                for part in model_choice.split(","):
+                    try:
+                        idx = int(part.strip()) - 1
+                        selected.append(aliases[idx])
+                    except (ValueError, IndexError):
+                        print(f"  Skipping invalid choice: {part.strip()}")
+        else:
+            print("\n  No models found in Ollama.")
+            selected, catalog = _ollama_manual_input(provider, catalog)
+
     else:
+        # --- Non-Ollama providers (existing logic) ---
+        auth_type = None
+        if provider.auth_types:
+            if len(provider.auth_types) == 1:
+                auth_type = provider.auth_types[0]
+            else:
+                print(f"\n  Auth method for {provider.display_name}:\n")
+                for i, at in enumerate(provider.auth_types, 1):
+                    label = at.replace("_", " ").title()
+                    print(f"    [{i}] {label}")
+                print()
+                at_choice = input("  Choose [1]: ").strip() or "1"
+                try:
+                    auth_type = provider.auth_types[int(at_choice) - 1]
+                except (ValueError, IndexError):
+                    print("  Invalid choice.")
+                    sys.exit(1)
+
+            status, msg = provider.validate()
+            if status.value != "ok":
+                print(f"\n  Need to authenticate with {provider.display_name}.")
+                ok, msg = provider.login(auth_type)
+                if not ok:
+                    print(f"\n  ✗ {msg}")
+                    sys.exit(1)
+                print(f"  ✓ {msg}")
+
         if auth_type and hasattr(provider, "get_models_for_auth"):
             catalog = provider.get_models_for_auth(auth_type)
         else:
             catalog = provider.models
 
-    if not catalog:
-        print("\n  No models available for this provider.")
-        sys.exit(1)
+        if not catalog:
+            print("\n  No models available for this provider.")
+            sys.exit(1)
 
-    aliases = list(catalog.keys())
-    print(f"\n  Available models for {provider.display_name}:\n")
-    for i, alias in enumerate(aliases, 1):
-        print(f"    [{i}] {alias}")
-    print(f"    [a] All")
-    print()
-    model_choice = input("  Choose (comma-separated, e.g. 1,3): ").strip()
+        aliases = list(catalog.keys())
+        print(f"\n  Available models for {provider.display_name}:\n")
+        for i, alias in enumerate(aliases, 1):
+            print(f"    [{i}] {alias}")
+        print(f"    [a] All")
+        print()
+        model_choice = input("  Choose (comma-separated, e.g. 1,3): ").strip()
 
-    selected = []
-    if model_choice.lower() == "a":
-        selected = aliases
-    else:
-        for part in model_choice.split(","):
-            try:
-                idx = int(part.strip()) - 1
-                selected.append(aliases[idx])
-            except (ValueError, IndexError):
-                print(f"  Skipping invalid choice: {part.strip()}")
+        selected = []
+        if model_choice.lower() == "a":
+            selected = aliases
+        else:
+            for part in model_choice.split(","):
+                try:
+                    idx = int(part.strip()) - 1
+                    selected.append(aliases[idx])
+                except (ValueError, IndexError):
+                    print(f"  Skipping invalid choice: {part.strip()}")
 
     if not selected:
         print("  No models selected.")
@@ -307,14 +339,38 @@ def _add_provider_first():
         sys.exit(1)
 
 
+def _ollama_manual_input(provider, catalog):
+    """Prompt for a model name manually. Offer to pull if not found.
+    Returns (selected_list, updated_catalog)."""
+    model_name = input("\n  Model name: ").strip()
+    if not model_name:
+        print("  Cancelled.")
+        sys.exit(1)
+
+    if model_name not in catalog:
+        pull = input(f"  '{model_name}' not found in Ollama. Pull it? [Y/n]: ").strip()
+        if pull.lower() != "n":
+            print()
+            ok, msg = provider.pull_model(model_name)
+            if not ok:
+                print(f"  ✗ {msg}")
+                sys.exit(1)
+            print(f"  ✓ {msg}")
+
+    catalog[model_name] = f"ollama/{model_name}"
+    return [model_name], catalog
+
+
 def _add_model_first():
     import config
     import container
     import providers
 
     combined = {}
+    ollama_provider = None
     for p in providers.all_providers():
         if p.name == "ollama":
+            ollama_provider = p
             ollama_models = p.discover_models()
             if not ollama_models:
                 print("  (Ollama not running — skipping its models)")
@@ -327,57 +383,87 @@ def _add_model_first():
                 key = f"{alias} ({p.display_name})"
                 combined[key] = (p, alias, model_str)
 
-    if not combined:
-        print("  No models available from any provider.")
-        sys.exit(1)
-
     keys = list(combined.keys())
     print(f"\n  Available models:\n")
     for i, key in enumerate(keys, 1):
         print(f"    [{i}] {key}")
+    if ollama_provider:
+        print(f"    [o] Enter an Ollama model name manually")
     print()
     choice = input("  Choose: ").strip()
-    try:
-        key = keys[int(choice) - 1]
-    except (ValueError, IndexError):
-        print("  Invalid choice.")
-        sys.exit(1)
 
-    provider, alias, model_str = combined[key]
-
-    auth_type = None
-    if provider.auth_types:
-        status, msg = provider.validate()
+    if choice.lower() == "o" and ollama_provider:
+        # Manual Ollama model input
+        status, msg = ollama_provider.validate()
         if status.value != "ok":
-            if len(provider.auth_types) > 1:
-                print(f"\n  Auth method for {provider.display_name}:\n")
-                for i, at in enumerate(provider.auth_types, 1):
-                    label = at.replace("_", " ").title()
-                    print(f"    [{i}] {label}")
-                print()
-                at_choice = input("  Choose [1]: ").strip() or "1"
-                try:
-                    auth_type = provider.auth_types[int(at_choice) - 1]
-                except (ValueError, IndexError):
-                    print("  Invalid choice.")
-                    sys.exit(1)
-            else:
-                auth_type = provider.auth_types[0]
-            print(f"\n  Need to authenticate with {provider.display_name}.")
-            ok, msg = provider.login(auth_type)
-            if not ok:
-                print(f"\n  ✗ {msg}")
-                sys.exit(1)
-            print(f"  ✓ {msg}")
-        else:
-            # Already authenticated — detect which auth type is active
-            auth_type = provider.detect_auth_type()
+            print(f"\n  ✗ {msg}")
+            sys.exit(1)
 
-        # Resolve model string based on auth type
-        if auth_type and hasattr(provider, "get_model_string"):
-            new_model_str = provider.get_model_string(alias, auth_type)
-            if new_model_str:
-                model_str = new_model_str
+        catalog = ollama_provider.discover_models()
+        model_name = input("\n  Model name: ").strip()
+        if not model_name:
+            print("  Cancelled.")
+            sys.exit(1)
+
+        if model_name not in catalog:
+            pull = input(f"  '{model_name}' not found in Ollama. Pull it? [Y/n]: ").strip()
+            if pull.lower() != "n":
+                print()
+                ok, msg = ollama_provider.pull_model(model_name)
+                if not ok:
+                    print(f"  ✗ {msg}")
+                    sys.exit(1)
+                print(f"  ✓ {msg}")
+
+        provider = ollama_provider
+        alias = model_name
+        model_str = f"ollama/{model_name}"
+    else:
+        if not combined:
+            print("  No models available from any provider.")
+            sys.exit(1)
+
+        try:
+            key = keys[int(choice) - 1]
+        except (ValueError, IndexError):
+            print("  Invalid choice.")
+            sys.exit(1)
+
+        provider, alias, model_str = combined[key]
+
+        auth_type = None
+        if provider.auth_types:
+            status, msg = provider.validate()
+            if status.value != "ok":
+                if len(provider.auth_types) > 1:
+                    print(f"\n  Auth method for {provider.display_name}:\n")
+                    for i, at in enumerate(provider.auth_types, 1):
+                        label = at.replace("_", " ").title()
+                        print(f"    [{i}] {label}")
+                    print()
+                    at_choice = input("  Choose [1]: ").strip() or "1"
+                    try:
+                        auth_type = provider.auth_types[int(at_choice) - 1]
+                    except (ValueError, IndexError):
+                        print("  Invalid choice.")
+                        sys.exit(1)
+                else:
+                    auth_type = provider.auth_types[0]
+                print(f"\n  Need to authenticate with {provider.display_name}.")
+                ok, msg = provider.login(auth_type)
+                if not ok:
+                    print(f"\n  ✗ {msg}")
+                    sys.exit(1)
+                print(f"  ✓ {msg}")
+            else:
+                # Already authenticated — detect which auth type is active
+                auth_type = provider.detect_auth_type()
+
+            # Resolve model string based on auth type
+            if auth_type and hasattr(provider, "get_model_string"):
+                new_model_str = provider.get_model_string(alias, auth_type)
+                if new_model_str:
+                    model_str = new_model_str
 
     existing_aliases = [m["alias"] for m in config.list_models()]
     final_alias = alias
