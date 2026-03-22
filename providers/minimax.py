@@ -18,7 +18,8 @@ class MiniMaxProvider(BaseProvider):
         """Extra litellm_params for MiniMax models."""
         return {"api_base": self.API_BASE}
 
-    API_BASE = "https://api.minimax.io/v1"
+    # LiteLLM appends /v1/ internally, so no trailing /v1 here
+    API_BASE = "https://api.minimax.io"
 
     def validate(self):
         api_key = config.get_env("MINIMAX_API_KEY")
@@ -27,7 +28,7 @@ class MiniMaxProvider(BaseProvider):
         # MiniMax has no /v1/models endpoint, so validate with a 1-token completion
         try:
             resp = requests.post(
-                f"{self.API_BASE}/chat/completions",
+                f"{self.API_BASE}/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}",
                          "Content-Type": "application/json"},
                 json={"model": "MiniMax-M2.5", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
