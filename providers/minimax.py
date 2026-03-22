@@ -14,21 +14,28 @@ class MiniMaxProvider(BaseProvider):
         "MiniMax-Text-01": "minimax/MiniMax-Text-01",
     }
 
-    API_URL = "https://api.minimaxi.chat/v1/models"
+    def get_extra_params(self):
+        """Extra litellm_params for MiniMax models."""
+        return {"api_base": self.API_BASE}
+
+    API_BASE = "https://api.minimax.io/v1"
 
     def validate(self):
         api_key = config.get_env("MINIMAX_API_KEY")
         if not api_key or is_placeholder(api_key):
             return Status.NOT_CONFIGURED, "MINIMAX_API_KEY not set"
+        # MiniMax has no /v1/models endpoint, so validate with a 1-token completion
         try:
-            resp = requests.get(
-                self.API_URL,
-                headers={"Authorization": f"Bearer {api_key}"},
+            resp = requests.post(
+                f"{self.API_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json={"model": "MiniMax-M2.5", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
                 timeout=10,
             )
             if resp.status_code == 200:
                 return Status.OK, "Authenticated with MiniMax"
-            if resp.status_code == 401:
+            if resp.status_code in (401, 403):
                 return Status.INVALID, "Invalid MINIMAX_API_KEY"
             return Status.INVALID, f"MiniMax returned status {resp.status_code}"
         except requests.RequestException as e:

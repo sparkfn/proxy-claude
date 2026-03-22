@@ -507,7 +507,7 @@ def cmd_model_add(provider_flag=None, model_flag=None, extra_args=None):
                 continue
 
         extra = {}
-        if provider.name == "ollama":
+        if hasattr(provider, "get_extra_params"):
             extra = provider.get_extra_params()
 
         s, msg = config.add_model(final_alias, model_str, extra)
