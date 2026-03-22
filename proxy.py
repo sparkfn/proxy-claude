@@ -303,6 +303,7 @@ def _anthropic_to_openai(body_bytes):
                 })
 
         # Emit messages in the right order
+        # OpenAI requires: assistant (with tool_calls) → tool results → user text
         if role == "assistant":
             msg_obj = {"role": "assistant"}
             text = "\n".join(t for t in text_parts if t)
@@ -314,11 +315,12 @@ def _anthropic_to_openai(body_bytes):
                 msg_obj["tool_calls"] = tool_calls
             messages.append(msg_obj)
         elif tool_results:
-            # tool_result blocks → separate tool role messages
-            if text_parts and any(t.strip() for t in text_parts):
-                messages.append({"role": "user", "content": "\n".join(text_parts)})
+            # Tool results MUST come immediately after assistant's tool_calls
             for tr in tool_results:
                 messages.append(tr)
+            # Any user text goes AFTER tool results
+            if text_parts and any(t.strip() for t in text_parts):
+                messages.append({"role": "user", "content": "\n".join(text_parts)})
         else:
             messages.append({"role": role, "content": "\n".join(text_parts) if text_parts else ""})
 
