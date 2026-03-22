@@ -191,10 +191,10 @@ class OpenAIProvider(BaseProvider):
     def _login_browser(self):
         """Drive the browser OAuth flow by reading container logs."""
         import container
-        # Pre-check
+        # Pre-check — OK and UNVERIFIED both mean auth is likely working
         status, msg = self.validate()
-        if status == Status.OK:
-            return Status.OK, f"Already authenticated. {msg}"
+        if status in (Status.OK, Status.UNVERIFIED):
+            return status, f"Already authenticated. {msg}"
 
         # Ensure container is running
         cs, _ = container.status()
@@ -207,6 +207,30 @@ class OpenAIProvider(BaseProvider):
 
         # Capture timestamp before looking for URL
         since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Trigger the OAuth flow — LiteLLM only emits the login URL
+        # when a request actually hits a chatgpt/ model endpoint
+        from container import PROXY_PORT
+        chatgpt_model = None
+        for m in config.list_models():
+            if m["model"].startswith("chatgpt/"):
+                chatgpt_model = m["alias"]
+                break
+        if chatgpt_model:
+            master_key = config.get_env("LITELLM_MASTER_KEY") or "sk-1234"
+            log.debug("Triggering OAuth flow with request to %s", chatgpt_model)
+            try:
+                requests.post(
+                    f"http://localhost:{PROXY_PORT}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {master_key}",
+                             "Content-Type": "application/json"},
+                    json={"model": chatgpt_model,
+                          "messages": [{"role": "user", "content": "hi"}],
+                          "max_tokens": 1},
+                    timeout=5,
+                )
+            except requests.RequestException:
+                pass  # Expected to fail — we just need it to trigger the auth URL in logs
 
         print("\n  Waiting for login instructions from container...")
         login_url = None

@@ -46,7 +46,7 @@ for p in providers.all_providers():
     result.append({
         "name": p.name,
         "display": p.display_name,
-        "auth_ok": status.value == "ok",
+        "auth_ok": status.value in ("ok", "unverified"),
         "auth_msg": msg
     })
 print(json.dumps(result))
