@@ -756,9 +756,11 @@ class Handler(BaseHTTPRequestHandler):
                         # Close any open text block
                         if text_block_open:
                             _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n")
-                        # Close any open tool blocks
+                            content_block_index += 1
+                            text_block_open = False
+                        # Close any open tool blocks (indices are relative to content_block_index)
                         for tc_idx in sorted(tool_blocks_started):
-                            block_idx = content_block_index + (1 if text_block_open else 0) + tc_idx
+                            block_idx = content_block_index + tc_idx
                             _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n")
 
                         stop = "end_turn" if finish_reason == "stop" else "tool_use" if finish_reason == "tool_calls" else finish_reason
