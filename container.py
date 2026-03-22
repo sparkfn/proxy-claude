@@ -161,10 +161,7 @@ def _start_proxy():
     exit_code = proc.poll()
     if exit_code is not None:
         log.warning("Proxy exited immediately with code %d", exit_code)
-        try:
-            os.unlink(PROXY_PID_FILE)
-        except OSError:
-            pass
+        _unlink_pid_file()
         return False
     return True
 
