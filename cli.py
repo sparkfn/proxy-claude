@@ -780,11 +780,14 @@ def main():
     rest = args[1:]
     log.debug("Executing command: %s %s", cmd, rest)
 
-    # --- Single-word infra commands (take no args, so any -h/--help means help) ---
+    # --- Single-word infra commands (take no args) ---
     if cmd in ("start", "stop", "restart", "status", "logs"):
         if any(a in ("-h", "--help") for a in rest):
             show_help()
             return
+        if rest:
+            print(f"  '{cmd}' does not accept arguments: {' '.join(rest)}")
+            sys.exit(1)
         if cmd == "start":
             import container
             s, msg = container.up()
