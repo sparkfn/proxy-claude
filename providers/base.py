@@ -59,7 +59,7 @@ class BaseProvider(ABC):
         """Returns (Status, message_string).
 
         credentials: dict of {env_var: value} collected by the CLI layer
-        using login_prompts. If None, provider may prompt directly (fallback).
+        using login_prompts. Returns Status.INVALID if None and credentials are required.
         """
         pass
 

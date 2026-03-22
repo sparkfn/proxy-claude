@@ -106,7 +106,7 @@ Providers inherit from `BaseProvider` (in `providers/base.py`) and must implemen
 - `login(auth_type, credentials=None) -> (Status, msg)` — authenticate with provided credentials
 - `login_prompts` dict — declares what credentials the CLI should collect per auth_type
 
-The CLI layer reads `login_prompts` to prompt the user, then passes a `credentials` dict to `login()`. Providers never call `input()` or `print()` directly.
+The CLI layer reads `login_prompts` to prompt the user, then passes a `credentials` dict to `login()`. Providers never call `input()`. Two methods still `print()` streaming progress that can't be batch-returned: `openai._login_browser()` (OAuth polling with countdown) and `ollama.pull_model()` (download progress).
 
 Registered in `providers/__init__.py` via `_register()` — order matters for display.
 
