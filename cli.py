@@ -20,29 +20,57 @@ def _setup_logging(verbose=False):
 def show_help():
     name = os.environ.get("LITELLM_CLI_NAME", os.path.basename(sys.argv[0]) or "./litellm.sh")
     print("LiteLLM Gateway CLI")
-    print(f"Usage: {name} [COMMAND] [OPTIONS]")
+    print(f"Usage: {name} <command> [options]")
     print()
-    print("Lifecycle:")
-    print("  up              Start the proxy container")
-    print("  down            Stop and remove the container")
-    print("  restart         Restart the container")
-    print("  status          Container and model status")
-    print("  logs            Stream container logs")
+    print("Infrastructure:")
+    print("  start             Start the proxy container")
+    print("  stop              Stop and remove the container")
+    print("  restart           Restart the container")
+    print("  status            Container and model status")
+    print("  logs              Stream container logs")
     print()
     print("Models:")
-    print("  add             Add a model or provider (interactive wizard)")
-    print("  remove          Remove a configured model")
-    print("  models          List configured models")
+    print("  model add         Add models (interactive)")
+    print("  model rm          Remove a configured model")
+    print("  model list        List configured models")
     print()
-    print("Auth:")
-    print("  login [provider]  Authenticate with a provider")
-    print("                    No arg: show auth status for all providers")
+    print("Providers:")
+    print("  provider list     Show available providers")
+    print("  provider status   Show auth status per provider")
+    print("  provider login    Authenticate with a provider")
+    print("  provider logout   Remove provider credentials")
     print()
-    print("Tools:")
-    print("  claude [args]   Launch Claude Code through the proxy")
+    print("Launch:")
+    print("  launch claude     Launch Claude Code through the proxy")
     print()
     print("Options:")
-    print("  --verbose, -v   Enable debug logging")
+    print("  --verbose, -v     Enable debug logging")
+
+
+def _show_group_help(group):
+    """Print subcommand help for a command group."""
+    name = os.environ.get("LITELLM_CLI_NAME", os.path.basename(sys.argv[0]) or "./litellm.sh")
+    usage = {
+        "model": [
+            ("add [--provider X]", "Add models (interactive)"),
+            ("rm [--provider X]", "Remove a configured model"),
+            ("list [--provider X]", "List configured models"),
+        ],
+        "provider": [
+            ("list", "Show available providers"),
+            ("status", "Show auth status per provider"),
+            ("login [name]", "Authenticate with a provider"),
+            ("logout [name]", "Remove provider credentials"),
+        ],
+        "launch": [
+            ("claude [--provider X] [--model Y] [-- args...]", "Launch Claude Code through the proxy"),
+        ],
+    }
+    if group not in usage:
+        return
+    print(f"Usage: {name} {group} <subcommand>\n")
+    for sub, desc in usage[group]:
+        print(f"  {name} {group} {sub:<40} {desc}")
 
 
 def cmd_status():
@@ -71,19 +99,19 @@ def cmd_status():
                 auth_cache[m["provider"]] = provider.validate()
             auth_status, _ = auth_cache[m["provider"]]
             if auth_status == Status.OK:
-                icon = "✓"
+                icon = "\u2713"
                 label = "authenticated" if m["provider"] != "ollama" else "reachable"
             elif auth_status == Status.UNVERIFIED:
                 icon = "?"
                 label = "unverified"
             elif auth_status == Status.NOT_CONFIGURED:
-                icon = "✗"
+                icon = "\u2717"
                 label = "not configured"
             elif auth_status == Status.UNREACHABLE:
-                icon = "✗"
+                icon = "\u2717"
                 label = "unreachable"
             else:
-                icon = "✗"
+                icon = "\u2717"
                 label = "invalid"
         else:
             icon = "-"
@@ -91,65 +119,10 @@ def cmd_status():
         print(f"  {m['alias']:<12} {m['provider']:<10} {icon} {label}")
 
 
-def cmd_models():
-    import config
-    models = config.list_models()
-    if not models:
-        print("No models configured.")
-        return
-    print("Configured models:")
-    for m in models:
-        print(f"  {m['alias']:<12} {m['provider']:<10} ({m['model']})")
-
-
-def cmd_login(provider_name=None):
-    import providers
-
-    if provider_name is None:
-        print("Provider auth status:\n")
-        for p in providers.all_providers():
-            status, msg = p.validate()
-            if status == Status.OK:
-                print(f"  {p.display_name:<20} ✓ {msg}")
-            elif status == Status.UNVERIFIED:
-                print(f"  {p.display_name:<20} ? {msg}")
-            else:
-                print(f"  {p.display_name:<20} ✗ {msg}")
-        return
-
-    provider = providers.get_provider(provider_name)
-    if not provider:
-        print(f"Unknown provider: {provider_name}")
-        print(f"Available: {', '.join(p.name for p in providers.all_providers())}")
-        sys.exit(1)
-
-    status, msg = provider.validate()
-
-    auth_type = None
-    if len(provider.auth_types) == 0:
-        # Provider manages its own auth (e.g. Ollama)
-        ls, msg = provider.login()
-        icon = "✓" if ls == Status.OK else "?" if ls == Status.UNVERIFIED else "✗"
-        print(f"  {icon} {msg}")
-        if provider.name == "ollama" and ls == Status.OK:
-            _ollama_interactive_login(provider)
-        return
-
-    if status == Status.OK:
-        print(f"  ✓ Already authenticated with {provider.display_name}. {msg}")
-        return
-
-    auth_type = _choose_auth_type(provider)
-    credentials = _prompt_credentials(provider, auth_type)
-    result = _print_login_result(*provider.login(auth_type, credentials=credentials))
-    if result not in (Status.OK, Status.UNVERIFIED):
-        sys.exit(1)
-
-
 def _print_restart_failure():
     """Print container failure message with backup info if available."""
     import config
-    print(f"  ✗ Container failed to start. Check './litellm.sh logs' for details.")
+    print(f"  \u2717 Container failed to start. Check './litellm.sh logs' for details.")
     if os.path.exists(config.CONFIG_BACKUP):
         print(f"    Your previous config was backed up to litellm_config.yaml.bak")
 
@@ -173,7 +146,7 @@ def _ollama_interactive_login(provider):
     if choice.lower() == "y":
         print()
         s, msg = provider.ollama_cloud_login()
-        icon = "✓" if s == Status.OK else "✗"
+        icon = "\u2713" if s == Status.OK else "\u2717"
         print(f"  {icon} {msg}")
 
     # Show available models
@@ -192,7 +165,7 @@ def _ollama_interactive_login(provider):
     if pull:
         print()
         ok, pull_msg = provider.pull_model(pull)
-        icon = "✓" if ok else "✗"
+        icon = "\u2713" if ok else "\u2717"
         print(f"  {icon} {pull_msg}")
 
 
@@ -224,21 +197,6 @@ def _print_login_result(login_status, msg):
     else:
         print(f"\n  \u2717 {msg}")
     return login_status
-
-
-def _ensure_authenticated(provider, auth_type):
-    """Check auth and login if needed. Exits on failure."""
-    status, msg = provider.validate()
-    if status == Status.OK:
-        return
-    print(f"\n  Need to authenticate with {provider.display_name}.")
-    credentials = _prompt_credentials(provider, auth_type)
-    result = _print_login_result(*provider.login(auth_type, credentials=credentials))
-    if result == Status.UNVERIFIED:
-        print(f"  Aborting \u2014 cannot add models with unverified auth.")
-        sys.exit(1)
-    elif result != Status.OK:
-        sys.exit(1)
 
 
 def _restart_and_report(context_msg, provider=None, added=None):
@@ -279,116 +237,262 @@ def _restart_and_report(context_msg, provider=None, added=None):
         print(f"  Container is running.")
 
 
-def cmd_add():
-    print("\n  What would you like to add?\n")
-    print("    [1] A provider (then pick models)")
-    print("    [2] A specific model")
-    print()
-    choice = input("  Choose [1]: ").strip() or "1"
+def _ollama_manual_input(provider, catalog):
+    """Prompt for a model name manually. Offer to pull if not found.
+    Returns (selected_list, updated_catalog)."""
+    model_name = input("\n  Model name: ").strip()
+    if not model_name:
+        print("  Cancelled.")
+        sys.exit(1)
 
-    if choice == "1":
-        _add_provider_first()
-    elif choice == "2":
-        _add_model_first()
+    if model_name not in catalog:
+        pull = input(f"  '{model_name}' not found in Ollama. Pull it? [Y/n]: ").strip()
+        if pull.lower() != "n":
+            print()
+            ok, msg = provider.pull_model(model_name)
+            if not ok:
+                print(f"  \u2717 {msg}")
+                sys.exit(1)
+            print(f"  \u2713 {msg}")
+
+    catalog[model_name] = f"ollama/{model_name}"
+    return [model_name], catalog
+
+
+# --- Provider commands ---
+
+def cmd_provider_list(provider_flag=None, model_flag=None, extra_args=None):
+    """Show available providers."""
+    import providers
+    print("\n  Available providers:\n")
+    for p in providers.all_providers():
+        print(f"    {p.name:<12} {p.display_name}")
+
+
+def cmd_provider_status(provider_flag=None, model_flag=None, extra_args=None):
+    """Show auth status per provider."""
+    import providers
+    print("\n  Provider auth status:\n")
+    for p in providers.all_providers():
+        status, msg = p.validate()
+        if status == Status.OK:
+            print(f"    {p.display_name:<20} \u2713 {msg}")
+        elif status == Status.UNVERIFIED:
+            print(f"    {p.display_name:<20} ? {msg}")
+        else:
+            print(f"    {p.display_name:<20} \u2717 {msg}")
+
+
+def cmd_provider_login(provider_flag=None, model_flag=None, extra_args=None):
+    """Authenticate with a provider."""
+    import providers
+
+    # Provider name from flag, positional arg, or interactive
+    provider_name = provider_flag or (extra_args[0] if extra_args else None)
+
+    if provider_name is None:
+        all_provs = providers.all_providers()
+        print("\n  Select a provider:\n")
+        for i, p in enumerate(all_provs, 1):
+            print(f"    [{i}] {p.display_name}")
+        print()
+        choice = input("  Choose: ").strip()
+        try:
+            provider = all_provs[int(choice) - 1]
+        except (ValueError, IndexError):
+            print("  Invalid choice.")
+            sys.exit(1)
     else:
-        print("  Invalid choice.")
+        provider = providers.get_provider(provider_name)
+        if not provider:
+            print(f"  Unknown provider: {provider_name}")
+            print(f"  Available: {', '.join(p.name for p in providers.all_providers())}")
+            sys.exit(1)
+
+    # Providers with no auth_types (e.g. Ollama)
+    if len(provider.auth_types) == 0:
+        ls, msg = provider.login()
+        icon = "\u2713" if ls == Status.OK else "?" if ls == Status.UNVERIFIED else "\u2717"
+        print(f"  {icon} {msg}")
+        if provider.name == "ollama" and ls == Status.OK:
+            _ollama_interactive_login(provider)
+        return
+
+    # Check if already authenticated (only short-circuit on OK, not UNVERIFIED --
+    # UNVERIFIED users may want to re-authenticate with better credentials)
+    status, msg = provider.validate()
+    if status == Status.OK:
+        print(f"  \u2713 Already authenticated with {provider.display_name}. {msg}")
+        return
+
+    auth_type = _choose_auth_type(provider)
+    credentials = _prompt_credentials(provider, auth_type)
+    result = _print_login_result(*provider.login(auth_type, credentials=credentials))
+    if result not in (Status.OK, Status.UNVERIFIED):
         sys.exit(1)
 
 
-def _add_provider_first():
+def cmd_provider_logout(provider_flag=None, model_flag=None, extra_args=None):
+    """Remove provider credentials."""
+    import providers
+    import config
+
+    provider_name = provider_flag or (extra_args[0] if extra_args else None)
+
+    if provider_name is None:
+        all_provs = providers.all_providers()
+        print("\n  Select a provider:\n")
+        for i, p in enumerate(all_provs, 1):
+            print(f"    [{i}] {p.display_name}")
+        print()
+        choice = input("  Choose: ").strip()
+        try:
+            provider = all_provs[int(choice) - 1]
+        except (ValueError, IndexError):
+            print("  Invalid choice.")
+            sys.exit(1)
+    else:
+        provider = providers.get_provider(provider_name)
+        if not provider:
+            print(f"  Unknown provider: {provider_name}")
+            sys.exit(1)
+
+    # Detect active auth type and handle accordingly
+    if provider.name == "ollama":
+        print("  Ollama has no stored credentials.")
+        return
+
+    auth_type = provider.detect_auth_type()
+    env_vars_for_auth = provider.env_vars.get(auth_type, []) if auth_type else []
+
+    if not env_vars_for_auth:
+        # Browser OAuth or no env vars -- can't clear programmatically
+        print(f"  {provider.display_name} browser OAuth credentials are managed by the container.")
+        print(f"  Restart with './litellm.sh restart' to reset.")
+        return
+
+    confirm = input(
+        f"  Remove {', '.join(env_vars_for_auth)} from .env? [y/N]: "
+    ).strip().lower()
+    if confirm != "y":
+        print("  Cancelled.")
+        return
+
+    for var in env_vars_for_auth:
+        config.remove_env(var)
+    print(f"  \u2713 Removed credentials for {provider.display_name}.")
+
+
+# --- Model commands ---
+
+def cmd_model_list(provider_flag=None, model_flag=None, extra_args=None):
+    """List configured models, optionally filtered by provider."""
+    import config
+    models = config.list_models()
+    if provider_flag:
+        models = [m for m in models if m["provider"] == provider_flag]
+    if not models:
+        print("  No models configured." if not provider_flag
+              else f"  No models configured for provider '{provider_flag}'.")
+        return
+    print("  Configured models:")
+    for m in models:
+        print(f"    {m['alias']:<12} {m['provider']:<10} ({m['model']})")
+
+
+def cmd_model_add(provider_flag=None, model_flag=None, extra_args=None):
+    """Add models for a provider."""
     import config
     import providers
 
-    all_provs = providers.all_providers()
-    print(f"\n  Select a provider:\n")
-    for i, p in enumerate(all_provs, 1):
-        print(f"    [{i}] {p.display_name}")
-    print()
-    choice = input("  Choose: ").strip()
-    try:
-        provider = all_provs[int(choice) - 1]
-    except (ValueError, IndexError):
-        print("  Invalid choice.")
-        sys.exit(1)
+    # Step 1: Pick provider
+    if provider_flag:
+        provider = providers.get_provider(provider_flag)
+        if not provider:
+            print(f"  Unknown provider: {provider_flag}")
+            print(f"  Available: {', '.join(p.name for p in providers.all_providers())}")
+            sys.exit(1)
+    else:
+        all_provs = providers.all_providers()
+        print("\n  Select a provider:\n")
+        for i, p in enumerate(all_provs, 1):
+            print(f"    [{i}] {p.display_name}")
+        print()
+        choice = input("  Choose: ").strip()
+        try:
+            provider = all_provs[int(choice) - 1]
+        except (ValueError, IndexError):
+            print("  Invalid choice.")
+            sys.exit(1)
 
+    # Step 2: Check provider is ready
     if provider.name == "ollama":
-        # --- Ollama: must be running locally ---
         status, msg = provider.validate()
         if status != Status.OK:
-            print(f"\n  ✗ {msg}")
+            print(f"\n  \u2717 Ollama is not running. Start it first.")
             sys.exit(1)
         catalog = provider.discover_models()
         if catalog is None:
-            print(f"\n  Cannot reach Ollama. Check that it's running.")
+            print(f"\n  \u2717 Cannot reach Ollama.")
+            sys.exit(1)
+    else:
+        status, msg = provider.validate()
+        if status not in (Status.OK, Status.UNVERIFIED):
+            print(f"\n  \u2717 {provider.display_name} is not authenticated.")
+            print(f"    Run: ./litellm.sh provider login {provider.name}")
             sys.exit(1)
 
-        # --- Ollama model selection (with manual input + pull) ---
-        aliases = list(catalog.keys())
-        if aliases:
-            print(f"\n  Available Ollama models:\n")
-            for i, alias in enumerate(aliases, 1):
-                print(f"    [{i}] {alias}")
-            print(f"    [m] Enter model name manually")
-            print(f"    [a] All")
-            print()
-            model_choice = input("  Choose (comma-separated, e.g. 1,3): ").strip()
-
-            if model_choice.lower() == "m":
-                selected, catalog = _ollama_manual_input(provider, catalog)
-            elif model_choice.lower() == "a":
-                selected = aliases
-            else:
-                selected = []
-                for part in model_choice.split(","):
-                    try:
-                        idx = int(part.strip()) - 1
-                        selected.append(aliases[idx])
-                    except (ValueError, IndexError):
-                        print(f"  Skipping invalid choice: {part.strip()}")
-        else:
-            print("\n  No models found in Ollama.")
-            selected, catalog = _ollama_manual_input(provider, catalog)
-
-    else:
-        # --- Non-Ollama providers ---
-        auth_type = _choose_auth_type(provider)
-        if auth_type:
-            _ensure_authenticated(provider, auth_type)
-
-        if auth_type and hasattr(provider, "get_models_for_auth"):
+        auth_type = provider.detect_auth_type()
+        if hasattr(provider, "get_models_for_auth") and auth_type:
             catalog = provider.get_models_for_auth(auth_type)
         else:
             catalog = provider.models
 
-        if not catalog:
-            print("\n  No models available for this provider.")
-            sys.exit(1)
+    if not catalog:
+        print("\n  No models available for this provider.")
+        sys.exit(1)
 
-        aliases = list(catalog.keys())
+    # Step 3: Show catalog with checkmarks for already-configured
+    existing_aliases = {m["alias"] for m in config.list_models()}
+    aliases = list(catalog.keys())
+
+    if provider.name == "ollama":
+        print(f"\n  Available Ollama models:\n")
+        for i, alias in enumerate(aliases, 1):
+            mark = " \u2713" if alias in existing_aliases else ""
+            print(f"    [{i}] {alias}{mark}")
+        print(f"    [m] Enter model name manually")
+        print(f"    [a] All")
+    else:
         print(f"\n  Available models for {provider.display_name}:\n")
         for i, alias in enumerate(aliases, 1):
-            print(f"    [{i}] {alias}")
+            mark = " \u2713" if alias in existing_aliases else ""
+            print(f"    [{i}] {alias}{mark}")
         print(f"    [a] All")
-        print()
-        model_choice = input("  Choose (comma-separated, e.g. 1,3): ").strip()
 
+    print()
+    model_choice = input("  Choose (comma-separated, e.g. 1,3): ").strip()
+
+    # Step 4: Parse selection
+    if provider.name == "ollama" and model_choice.lower() == "m":
+        selected, catalog = _ollama_manual_input(provider, catalog)
+    elif model_choice.lower() == "a":
+        selected = aliases
+    else:
         selected = []
-        if model_choice.lower() == "a":
-            selected = aliases
-        else:
-            for part in model_choice.split(","):
-                try:
-                    idx = int(part.strip()) - 1
-                    selected.append(aliases[idx])
-                except (ValueError, IndexError):
-                    print(f"  Skipping invalid choice: {part.strip()}")
+        for part in model_choice.split(","):
+            try:
+                idx = int(part.strip()) - 1
+                selected.append(aliases[idx])
+            except (ValueError, IndexError):
+                print(f"  Skipping invalid choice: {part.strip()}")
 
     if not selected:
         print("  No models selected.")
         sys.exit(1)
 
+    # Step 5: Add each model
     added = []
-    existing_aliases = [m["alias"] for m in config.list_models()]
     for alias in selected:
         model_str = catalog[alias]
         final_alias = alias
@@ -406,162 +510,35 @@ def _add_provider_first():
         s, msg = config.add_model(final_alias, model_str, extra)
         if s == Status.OK:
             added.append(final_alias)
-            existing_aliases.append(final_alias)
-            print(f"  ✓ {msg}")
+            existing_aliases.add(final_alias)
+            print(f"  \u2713 {msg}")
         else:
-            print(f"  ✗ {msg}")
+            print(f"  \u2717 {msg}")
 
     if not added:
         print("\n  No models added.")
         return
 
-    _restart_and_report("adding models", provider=provider, added=added)
-
-
-def _ollama_manual_input(provider, catalog):
-    """Prompt for a model name manually. Offer to pull if not found.
-    Returns (selected_list, updated_catalog)."""
-    model_name = input("\n  Model name: ").strip()
-    if not model_name:
-        print("  Cancelled.")
-        sys.exit(1)
-
-    if model_name not in catalog:
-        pull = input(f"  '{model_name}' not found in Ollama. Pull it? [Y/n]: ").strip()
-        if pull.lower() != "n":
-            print()
-            ok, msg = provider.pull_model(model_name)
-            if not ok:
-                print(f"  ✗ {msg}")
-                sys.exit(1)
-            print(f"  ✓ {msg}")
-
-    catalog[model_name] = f"ollama/{model_name}"
-    return [model_name], catalog
-
-
-def _add_model_first():
-    import config
-    import providers
-
-    combined = {}
-    ollama_provider = None
-    for p in providers.all_providers():
-        if p.name == "ollama":
-            ollama_provider = p
-            ollama_models = p.discover_models()
-            if ollama_models is None:
-                print("  (Ollama not reachable \u2014 skipping its models)")
-                ollama_models = {}
-            elif not ollama_models:
-                print("  (Ollama has no models \u2014 pull one first)")
-            if ollama_models:
-                for alias, model_str in ollama_models.items():
-                    key = f"{alias} ({p.display_name})"
-                    combined[key] = (p, alias, model_str)
-        else:
-            for alias, model_str in p.models.items():
-                key = f"{alias} ({p.display_name})"
-                combined[key] = (p, alias, model_str)
-
-    keys = list(combined.keys())
-    print(f"\n  Available models:\n")
-    for i, key in enumerate(keys, 1):
-        print(f"    [{i}] {key}")
-    if ollama_provider:
-        print(f"    [o] Enter an Ollama model name manually")
-    print()
-    choice = input("  Choose: ").strip()
-
-    if choice.lower() == "o" and ollama_provider:
-        # Manual Ollama model input
-        status, msg = ollama_provider.validate()
-        if status != Status.OK:
-            print(f"\n  ✗ {msg}")
-            sys.exit(1)
-
-        catalog = ollama_provider.discover_models()
-        if catalog is None:
-            print("\n  Cannot reach Ollama. Check that it's running.")
-            sys.exit(1)
-        model_name = input("\n  Model name: ").strip()
-        if not model_name:
-            print("  Cancelled.")
-            sys.exit(1)
-
-        if model_name not in catalog:
-            pull = input(f"  '{model_name}' not found in Ollama. Pull it? [Y/n]: ").strip()
-            if pull.lower() != "n":
-                print()
-                ok, msg = ollama_provider.pull_model(model_name)
-                if not ok:
-                    print(f"  ✗ {msg}")
-                    sys.exit(1)
-                print(f"  ✓ {msg}")
-
-        provider = ollama_provider
-        alias = model_name
-        model_str = f"ollama/{model_name}"
+    # Step 6: Restart if container is running
+    import container
+    cs, _ = container.status()
+    if cs == Status.OK:
+        _restart_and_report("adding models", provider=provider, added=added)
     else:
-        if not combined:
-            print("  No models available from any provider.")
-            sys.exit(1)
-
-        try:
-            key = keys[int(choice) - 1]
-        except (ValueError, IndexError):
-            print("  Invalid choice.")
-            sys.exit(1)
-
-        provider, alias, model_str = combined[key]
-
-        if provider.auth_types:
-            status, msg = provider.validate()
-            if status != Status.OK:
-                auth_type = _choose_auth_type(provider)
-                _ensure_authenticated(provider, auth_type)
-            else:
-                auth_type = provider.detect_auth_type()
-
-            # Resolve model string based on auth type
-            if auth_type and hasattr(provider, "get_model_string"):
-                new_model_str = provider.get_model_string(alias, auth_type)
-                if new_model_str:
-                    model_str = new_model_str
-
-    existing_aliases = [m["alias"] for m in config.list_models()]
-    final_alias = alias
-    if alias in existing_aliases:
-        print(f"\n  Alias '{alias}' already exists.")
-        final_alias = input(f"  Enter a different alias: ").strip()
-        if not final_alias or final_alias in existing_aliases:
-            print("  Cancelled.")
-            sys.exit(1)
-    else:
-        custom = input(f"  Alias [{alias}]: ").strip()
-        if custom:
-            final_alias = custom
-
-    extra = {}
-    if provider.name == "ollama":
-        extra = provider.get_extra_params()
-
-    s, msg = config.add_model(final_alias, model_str, extra)
-    if s != Status.OK:
-        print(f"  ✗ {msg}")
-        sys.exit(1)
-    print(f"  ✓ {msg}")
-
-    _restart_and_report(f"adding model {final_alias}", provider=provider, added=[final_alias])
+        print(f"\n  Added: {', '.join(added)}. Start the proxy with './litellm.sh start'.")
 
 
-def cmd_remove():
+def cmd_model_rm(provider_flag=None, model_flag=None, extra_args=None):
+    """Remove configured models."""
     import config
     import providers
 
     models = config.list_models()
+    if provider_flag:
+        models = [m for m in models if m["provider"] == provider_flag]
     if not models:
-        print("  No models configured.")
+        print("  No models configured." if not provider_flag
+              else f"  No models configured for provider '{provider_flag}'.")
         return
 
     print(f"\n  Configured models:\n")
@@ -595,12 +572,13 @@ def cmd_remove():
         provider_name = model["provider"]
         s, msg = config.remove_model(model["alias"])
         if s == Status.OK:
-            print(f"  ✓ {msg}")
+            print(f"  \u2713 {msg}")
             if provider_name:
                 removed_providers.add(provider_name)
         else:
-            print(f"  ✗ {msg}")
+            print(f"  \u2717 {msg}")
 
+    # Offer to clean up env vars if last model for a provider was removed
     for pname in removed_providers:
         if not config.provider_has_models(pname):
             provider = providers.get_provider(pname)
@@ -616,56 +594,146 @@ def cmd_remove():
                     if cleanup == "y":
                         for var in all_env_vars:
                             config.remove_env(var)
-                        print(f"  ✓ Cleaned up env vars.")
+                        print(f"  \u2713 Cleaned up env vars.")
 
-    _restart_and_report("removing models")
-
-
-def cmd_claude(extra_args):
-    """Launch Claude Code routed through the LiteLLM proxy."""
-    import shutil
-    import subprocess
+    # Restart only if container is running
     import container
+    cs, _ = container.status()
+    if cs == Status.OK:
+        _restart_and_report("removing models")
+    else:
+        print("\n  Models removed. Proxy is not running.")
 
-    # Find claude binary
+
+# --- Launch commands ---
+
+def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None):
+    """Launch Claude Code through the LiteLLM proxy."""
+    import shutil
+    import config
+    import container
+    import providers
+
+    extra_args = extra_args or []
+
+    # Step 1: Check claude binary
     claude_bin = shutil.which("claude")
     if not claude_bin:
-        print("  ✗ Claude Code CLI not found. Install it first:")
+        print("  \u2717 Claude Code CLI not found. Install it first:")
         print("    npm install -g @anthropic-ai/claude-code")
         sys.exit(1)
 
-    # Ensure proxy is running
+    # Step 2: Ensure proxy is running
     cs, _ = container.status()
     if cs != Status.OK:
-        print("  Starting proxy...")
-        s, msg = container.up()
-        if s != Status.OK:
-            print(f"  ✗ {msg}")
+        print("  \u2717 Proxy is not running. Start it first:")
+        print("    ./litellm.sh start")
+        sys.exit(1)
+
+    # Step 3: Pick provider (only authenticated ones)
+    all_provs = providers.all_providers()
+    configured_models = config.list_models()
+
+    if provider_flag:
+        provider = providers.get_provider(provider_flag)
+        if not provider:
+            print(f"  Unknown provider: {provider_flag}")
             sys.exit(1)
-        if not container.wait_healthy():
-            print("  ✗ Container not healthy after startup")
+    else:
+        # Find providers that have configured models and are authenticated
+        ready = []
+        for p in all_provs:
+            p_models = [m for m in configured_models if m["provider"] == p.name]
+            if not p_models:
+                continue
+            s, _ = p.validate()
+            if s in (Status.OK, Status.UNVERIFIED):
+                ready.append(p)
+
+        if not ready:
+            print("  \u2717 No authenticated providers with configured models.")
+            print("    Run: ./litellm.sh provider login <name>")
+            print("    Then: ./litellm.sh model add")
             sys.exit(1)
 
-    # Route through the LiteLLM proxy using the master key for auth
-    import config
+        if len(ready) == 1:
+            provider = ready[0]
+        else:
+            print("\n  Select a provider:\n")
+            for i, p in enumerate(ready, 1):
+                print(f"    [{i}] {p.display_name}")
+            print()
+            choice = input("  Choose: ").strip()
+            try:
+                provider = ready[int(choice) - 1]
+            except (ValueError, IndexError):
+                print("  Invalid choice.")
+                sys.exit(1)
 
-    env = os.environ.copy()
-    env["ANTHROPIC_BASE_URL"] = f"http://localhost:{PORT}"
+    # Step 4: Pick model
+    p_models = [m for m in configured_models if m["provider"] == provider.name]
+    if not p_models:
+        print(f"  \u2717 No models configured for {provider.display_name}.")
+        print(f"    Run: ./litellm.sh model add --provider {provider.name}")
+        sys.exit(1)
+
+    if model_flag:
+        match = [m for m in p_models if m["alias"] == model_flag]
+        if not match:
+            print(f"  \u2717 Model '{model_flag}' not found for {provider.display_name}.")
+            print(f"  Available: {', '.join(m['alias'] for m in p_models)}")
+            sys.exit(1)
+        model = match[0]
+    elif len(p_models) == 1:
+        model = p_models[0]
+    else:
+        print(f"\n  Select a model:\n")
+        for i, m in enumerate(p_models, 1):
+            print(f"    [{i}] {m['alias']}")
+        print()
+        choice = input("  Choose: ").strip()
+        try:
+            model = p_models[int(choice) - 1]
+        except (ValueError, IndexError):
+            print("  Invalid choice.")
+            sys.exit(1)
+
+    # Step 5: Read master key
     master_key = config.get_env("LITELLM_MASTER_KEY") or "sk-1234"
-    env["ANTHROPIC_AUTH_TOKEN"] = master_key
 
-    # Set ANTHROPIC_MODEL if there's a configured anthropic/claude model
-    models = config.list_models()
-    for m in models:
-        if "claude" in m["model"].lower() or "anthropic" in m["model"].lower():
-            env.setdefault("ANTHROPIC_MODEL", m["alias"])
+    # Step 6: Launch
+    log.debug("Launching Claude Code: provider=%s model=%s", provider.name, model["alias"])
+    print(f"  Launching Claude Code ({model['alias']} via {provider.display_name})...")
+
+    os.environ["ANTHROPIC_BASE_URL"] = f"http://localhost:{PORT}"
+    os.environ["ANTHROPIC_AUTH_TOKEN"] = master_key
+    os.environ["ANTHROPIC_MODEL"] = model["alias"]
+    os.environ["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = "1"
+    os.execvp(claude_bin, [claude_bin] + extra_args)
+
+
+# --- Router ---
+
+def _parse_flags(args):
+    """Extract --provider and --model flags from args. Returns (provider, model, remaining_args)."""
+    provider = None
+    model = None
+    remaining = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--provider" and i + 1 < len(args):
+            provider = args[i + 1]
+            i += 2
+        elif args[i] == "--model" and i + 1 < len(args):
+            model = args[i + 1]
+            i += 2
+        elif args[i] == "--":
+            remaining.extend(args[i + 1:])
             break
-
-    log.debug("Launching Claude Code with ANTHROPIC_BASE_URL=%s", env["ANTHROPIC_BASE_URL"])
-
-    print(f"  Launching Claude Code through proxy (localhost:{PORT})...")
-    result = subprocess.run([claude_bin] + extra_args, env=env)
-    sys.exit(result.returncode)
+        else:
+            remaining.append(args[i])
+            i += 1
+    return provider, model, remaining
 
 
 def main():
@@ -687,44 +755,59 @@ def main():
     config._ensure_env()
 
     cmd = args[0]
-    log.debug("Executing command: %s", cmd)
+    rest = args[1:]
+    log.debug("Executing command: %s %s", cmd, rest)
 
-    if cmd == "up":
+    # --- Single-word infra commands ---
+    if cmd == "start":
         import container
         s, msg = container.up()
-        print(f"  {'✓' if s == Status.OK else '✗'} {msg}")
+        print(f"  {'\u2713' if s == Status.OK else '\u2717'} {msg}")
         if s != Status.OK:
             sys.exit(1)
-    elif cmd == "down":
+    elif cmd == "stop":
         import container
         s, msg = container.down()
         if s != Status.OK:
-            print(f"  ✗ {msg}")
+            print(f"  \u2717 {msg}")
             sys.exit(1)
     elif cmd == "restart":
         import container
         s, msg = container.restart()
         if s != Status.OK:
-            print(f"  ✗ {msg}")
+            print(f"  \u2717 {msg}")
             sys.exit(1)
     elif cmd == "status":
         cmd_status()
     elif cmd == "logs":
         import container
         container.logs()
-    elif cmd == "models":
-        cmd_models()
-    elif cmd == "login":
-        provider_name = args[1] if len(args) > 1 else None
-        cmd_login(provider_name)
-    elif cmd == "add":
-        cmd_add()
-    elif cmd == "remove":
-        cmd_remove()
-    elif cmd == "claude":
-        cmd_claude(args[1:])
+
+    # --- Subcommand groups ---
+    elif cmd in ("model", "provider", "launch"):
+        if not rest:
+            _show_group_help(cmd)
+            sys.exit(1)
+        sub = rest[0]
+        sub_rest = rest[1:]
+        provider_flag, model_flag, remaining = _parse_flags(sub_rest)
+
+        dispatch = {
+            "model": {"add": cmd_model_add, "rm": cmd_model_rm, "list": cmd_model_list},
+            "provider": {"list": cmd_provider_list, "status": cmd_provider_status,
+                         "login": cmd_provider_login, "logout": cmd_provider_logout},
+            "launch": {"claude": cmd_launch_claude},
+        }
+        handler = dispatch.get(cmd, {}).get(sub)
+        if not handler:
+            print(f"  Unknown subcommand: {cmd} {sub}")
+            _show_group_help(cmd)
+            sys.exit(1)
+
+        handler(provider_flag=provider_flag, model_flag=model_flag, extra_args=remaining)
+
     else:
-        print(f"Unknown command: {cmd}")
+        print(f"  Unknown command: {cmd}")
         show_help()
         sys.exit(1)
 
@@ -736,5 +819,5 @@ if __name__ == "__main__":
         print("\n  Cancelled.")
         sys.exit(130)
     except DockerNotFoundError as e:
-        print(f"  ✗ {e}")
+        print(f"  \u2717 {e}")
         sys.exit(1)
