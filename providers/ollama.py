@@ -131,7 +131,7 @@ class OllamaProvider(BaseProvider):
             return None
 
     def pull_model(self, model_name):
-        """Pull a model via Ollama REST API. Returns (success, message)."""
+        """Pull a model via Ollama REST API. Returns (Status, message)."""
         try:
             resp = requests.post(
                 f"{self.OLLAMA_HOST}/api/pull",
@@ -140,7 +140,7 @@ class OllamaProvider(BaseProvider):
                 timeout=600,
             )
             if resp.status_code != 200:
-                return False, f"Pull failed with status {resp.status_code}"
+                return Status.FAILED, f"Pull failed with status {resp.status_code}"
 
             # Set socket idle timeout to detect stalled transfers
             try:
@@ -166,9 +166,9 @@ class OllamaProvider(BaseProvider):
                         print(f"\r  {status}              ", end="", flush=True)
                     last_status = status
             print()
-            return True, f"Pulled {model_name}"
+            return Status.OK, f"Pulled {model_name}"
         except requests.RequestException as e:
-            return False, f"Pull failed: {e}"
+            return Status.FAILED, f"Pull failed: {e}"
 
     def get_model_string(self, alias, auth_type=None):
         return f"ollama/{alias}"

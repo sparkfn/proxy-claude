@@ -81,7 +81,7 @@ def cmd_status():
     import config
     import providers
 
-    cs, output = container.status()
+    cs, _ = container.status()
     state = "running" if cs == Status.OK else "stopped"
     print(f"Container:  litellm-proxy  [{state}]")
     print(f"Port:       localhost:{PORT}")
@@ -167,8 +167,8 @@ def _ollama_interactive_login(provider):
     pull = input("\n  Pull a model? Enter name (or Enter to skip): ").strip()
     if pull:
         print()
-        ok, pull_msg = provider.pull_model(pull)
-        icon = "\u2713" if ok else "\u2717"
+        ps, pull_msg = provider.pull_model(pull)
+        icon = "\u2713" if ps == Status.OK else "\u2717"
         print(f"  {icon} {pull_msg}")
 
 
@@ -252,8 +252,8 @@ def _ollama_manual_input(provider, catalog):
         pull = input(f"  '{model_name}' not found in Ollama. Pull it? [Y/n]: ").strip()
         if pull.lower() != "n":
             print()
-            ok, msg = provider.pull_model(model_name)
-            if not ok:
+            ps, msg = provider.pull_model(model_name)
+            if ps != Status.OK:
                 print(f"  \u2717 {msg}")
                 sys.exit(1)
             print(f"  \u2713 {msg}")
@@ -828,4 +828,8 @@ if __name__ == "__main__":
         sys.exit(1)
     except DockerNotFoundError as e:
         print(f"  \u2717 {e}")
+        sys.exit(1)
+    except Exception as e:
+        log.debug("Unhandled exception", exc_info=True)
+        print(f"  \u2717 Unexpected error: {e}")
         sys.exit(1)

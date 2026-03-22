@@ -185,8 +185,8 @@ def _load_translated_models():
             litellm_model = entry.get("litellm_params", {}).get("model", "")
             if litellm_model.startswith("openai/"):
                 translated.add(name)
-    except Exception:
-        pass
+    except Exception as e:
+        log.error("Failed to load litellm_config.yaml: %s — model translation disabled", e)
     _OPENAI_TRANSLATED_MODELS = translated
     _ALL_CONFIGURED_MODELS = all_models
     log.debug("Models needing OpenAI translation: %s", translated)

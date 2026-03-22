@@ -121,7 +121,10 @@ def add_model(alias, litellm_model, extra_params=None):
     if extra_params:
         new_entry["litellm_params"].update(extra_params)
     data["model_list"].append(new_entry)
-    _save_yaml(data)
+    try:
+        _save_yaml(data)
+    except OSError as e:
+        return Status.FAILED, f"Failed to save config: {e}"
     return Status.OK, f"Added '{alias}' -> {litellm_model}"
 
 
@@ -134,7 +137,10 @@ def remove_model(alias):
     ]
     if len(data["model_list"]) == original_len:
         return Status.NOT_FOUND, f"Model '{alias}' not found."
-    _save_yaml(data)
+    try:
+        _save_yaml(data)
+    except OSError as e:
+        return Status.FAILED, f"Failed to save config: {e}"
     return Status.OK, f"Removed '{alias}'"
 
 
