@@ -101,8 +101,8 @@ def _validate_messages(body_bytes):
     messages = data.get("messages")
     if messages is None:
         return "messages field is required"
-    if not isinstance(messages, list):
-        return "messages field must be a list"
+    if not isinstance(messages, list) or len(messages) == 0:
+        return "messages field must be a non-empty list"
     for msg in messages:
         if not isinstance(msg, dict) or "role" not in msg:
             return "each message must be an object with a role field"
