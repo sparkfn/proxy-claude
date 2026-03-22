@@ -5,9 +5,6 @@ model_list:
       drop_params: true
       modify_params: true
       supports_system_messages: false
-  - model_name: qwen-max
-    litellm_params:
-      model: dashscope/qwen-max
   - model_name: llama3
     litellm_params:
       model: ollama/llama3

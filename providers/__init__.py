@@ -1,5 +1,5 @@
 from providers.ollama import OllamaProvider
-from providers.alibaba import AlibabaProvider
+from providers.minimax import MiniMaxProvider
 from providers.openai import OpenAIProvider
 
 _PROVIDERS = {}
@@ -22,5 +22,5 @@ def all_providers():
 
 # Register providers (order matters for display)
 _register(OpenAIProvider)
-_register(AlibabaProvider)
+_register(MiniMaxProvider)
 _register(OllamaProvider)

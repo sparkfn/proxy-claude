@@ -11,7 +11,7 @@ Claude Code → localhost:2555 → LiteLLM Proxy (Docker) → LLM Provider
 | Provider | Auth | Models |
 |----------|------|--------|
 | **OpenAI** | Browser OAuth or API key | GPT-5.3, GPT-5.4 |
-| **Alibaba (DashScope)** | API key | Qwen-Max, Qwen-Plus, Qwen-Turbo |
+| **MiniMax** | API key | MiniMax-M2.7, MiniMax-M2.5, MiniMax-Text-01 |
 | **Ollama** | Local (no auth) or `ollama login` for cloud models | Any pulled model + cloud catalog |
 
 ## Quick Start
@@ -87,11 +87,11 @@ Flags skip interactive prompts:
 
 Browser login opens the OpenAI OAuth flow. API key is stored in `.env`.
 
-### Alibaba (DashScope)
+### MiniMax
 
 ```bash
-./litellm.sh provider login alibaba
-# Enter your DashScope API key
+./litellm.sh provider login minimax
+# Enter your MiniMax API key
 ```
 
 ### Ollama
@@ -123,7 +123,7 @@ cli.py              Main CLI — argument routing, interactive wizards
 config.py           Reads/writes litellm_config.yaml and .env
 container.py        Docker container lifecycle
 proxy.py            Local reverse proxy (port 2555 → container :4000)
-providers/          Provider registry (OpenAI, Alibaba, Ollama)
+providers/          Provider registry (OpenAI, MiniMax, Ollama)
 ```
 
 ### Files managed by the CLI

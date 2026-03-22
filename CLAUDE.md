@@ -68,7 +68,7 @@ Key files:
 - **proxy.py** — system message rewriter proxy (threaded HTTP server, supports SSE streaming pass-through, `logging`-based observability)
 - **providers/** — provider registry with `BaseProvider` ABC and `Status` enum
 - **docker-compose.yml** — single-service definition, maps port 4000 (not 2555; proxy.py handles 2555)
-- **litellm_config.yaml** — model registry (managed by CLI, uses litellm model string format like `chatgpt/gpt-5.4`, `dashscope/qwen-max`, `ollama/llama3`)
+- **litellm_config.yaml** — model registry (managed by CLI, uses litellm model string format like `chatgpt/gpt-5.4`, `minimax/MiniMax-M2.7`, `ollama/llama3`)
 - **.env** — API keys and master key (managed by CLI, chmod 600)
 - **auth/** — mounted into container at `/root/.config/litellm` for browser OAuth persistence
 - **data/** — LiteLLM persistent state (mounted into container at `/root/.litellm`)
@@ -109,7 +109,7 @@ Registered in `providers/__init__.py` via `_register()` — order matters for di
 
 **Provider-specific details:**
 - **OpenAI** — two auth paths: `browser_oauth` (chatgpt/ prefix, uses container logs to find OAuth URL) and `api_key` (openai/ prefix, stored in `.env`). `get_models_for_auth()` returns different model catalogs per auth type. Browser OAuth flow (`_login_browser()`) is an exception to the no-print rule — it streams interactive progress (URL box, polling countdown) that can't be batch-returned.
-- **Alibaba** — single `api_key` auth via `DASHSCOPE_API_KEY` env var. Static model catalog.
+- **MiniMax** — single `api_key` auth via `MINIMAX_API_KEY` env var. Static model catalog (MiniMax-M2.7, M2.5, Text-01).
 - **Ollama** — no auth_types (validates connectivity only). `login()` returns pure status. Interactive flows (cloud login, model pull) are separate methods (`ollama_cloud_login()`, `pull_model()`) driven by `cli.py:_ollama_interactive_login()`. Dynamic model discovery via `/api/tags` — returns `None` on error, `{}` on empty. Models use `api_base: http://host.docker.internal:11434` to reach host Ollama from container. Respects `OLLAMA_HOST` env var.
 
 ### Adding a New Provider
