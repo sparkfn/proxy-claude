@@ -626,12 +626,17 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None):
         print("    npm install -g @anthropic-ai/claude-code")
         sys.exit(1)
 
-    # Step 2: Ensure proxy is running
+    # Step 2: Ensure proxy is running (auto-start if needed)
     cs, _ = container.status()
     if cs != Status.OK:
-        print("  \u2717 Proxy is not running. Start it first:")
-        print("    ./litellm.sh start")
-        sys.exit(1)
+        print("  Starting proxy...")
+        s, msg = container.up()
+        if s != Status.OK:
+            print(f"  \u2717 {msg}")
+            sys.exit(1)
+        if not container.wait_healthy():
+            print("  \u2717 Container not healthy after startup")
+            sys.exit(1)
 
     # Step 3: Pick provider (only authenticated ones)
     all_provs = providers.all_providers()
@@ -775,6 +780,14 @@ def main():
     rest = args[1:]
     log.debug("Executing command: %s %s", cmd, rest)
 
+    # --- Help check: applies to ALL commands (flat and subcommand) ---
+    if "-h" in rest or "--help" in rest or "help" in rest:
+        if cmd in SUBCOMMAND_REGISTRY:
+            _show_group_help(cmd)
+        else:
+            show_help()
+        return
+
     # --- Single-word infra commands ---
     if cmd == "start":
         import container
@@ -802,27 +815,16 @@ def main():
 
     # --- Subcommand groups ---
     elif cmd in SUBCOMMAND_REGISTRY:
-        # Help for the group itself
-        if not rest or rest[0] in ("-h", "--help", "help"):
+        if not rest:
             _show_group_help(cmd)
             return
 
         sub = rest[0]
-
-        # Help at the subcommand level
-        if "--help" in rest[1:] or "-h" in rest[1:]:
-            _show_group_help(cmd)
-            return
-
         sub_rest = rest[1:]
         provider_flag, model_flag, remaining = _parse_flags(sub_rest)
 
         entry = SUBCOMMAND_REGISTRY.get(cmd, {}).get(sub)
         if not entry or entry[0] is None:
-            # Also catch --help/help passed as subcommand name
-            if sub in ("-h", "--help", "help"):
-                _show_group_help(cmd)
-                return
             print(f"  Unknown subcommand: {cmd} {sub}")
             _show_group_help(cmd)
             sys.exit(1)
