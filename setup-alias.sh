@@ -3,7 +3,6 @@ set -euo pipefail
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PORT=2555
-CONFIG="$DIR/litellm_config.yaml"
 VENV="$DIR/.venv"
 
 echo ""
@@ -252,12 +251,13 @@ FUNC_BLOCK=$(cat <<FUNCEOF
 ${ALIAS_NAME}() {
   local _mk _env="${ENV_PATH}"
   if [ ! -r "\$_env" ]; then
-    echo "Warning: Cannot read \$_env — using default master key" >&2
+    echo "Error: Cannot read \$_env — refusing to use default credentials. Fix .env permissions." >&2
+    return 1
   fi
-  _mk=\$(grep "^LITELLM_MASTER_KEY=" "\$_env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+  _mk=\$(grep "^LITELLM_MASTER_KEY=" "\$_env" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
   if [ -z "\$_mk" ]; then
-    _mk="sk-1234"
-    echo "Warning: LITELLM_MASTER_KEY not found in \$_env — using default" >&2
+    echo "Error: LITELLM_MASTER_KEY not found in \$_env — set it with ./litellm.sh or add it manually." >&2
+    return 1
   fi
   ANTHROPIC_BASE_URL="http://localhost:${PORT}" \\
   ANTHROPIC_MODEL="${MODEL}" \\

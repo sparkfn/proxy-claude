@@ -88,21 +88,31 @@ def _run(args, capture=False, stream=False):
         )
 
 
-def _docker_running():
-    """Check if Docker daemon is running."""
+def _docker_status():
+    """Probe Docker availability. Returns (ok: bool, reason: str).
+
+    Distinguishes: binary not found, probe timed out, daemon not running.
+    """
+    docker = _docker_bin()
     try:
         result = subprocess.run(
-            [_docker_bin(), "info"], capture_output=True, text=True, timeout=30
+            [docker, "info"], capture_output=True, text=True, timeout=30
         )
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+        if result.returncode == 0:
+            return True, "Docker is running"
+        log.debug("docker info returned %d: %s", result.returncode, result.stderr.strip())
+        return False, "Docker daemon is not running. Start Docker Desktop and try again."
+    except FileNotFoundError:
+        return False, "Docker binary not found. Install Docker Desktop first."
+    except subprocess.TimeoutExpired:
+        return False, "Docker probe timed out (30s). Docker may be unresponsive."
 
 
 def _check_docker():
-    """Exit with message if Docker isn't available."""
-    if not _docker_running():
-        print("Error: Docker is not running. Start Docker and try again.")
+    """Exit with a specific message if Docker isn't available."""
+    ok, reason = _docker_status()
+    if not ok:
+        print(f"Error: {reason}")
         sys.exit(1)
 
 
@@ -334,8 +344,10 @@ def wait_healthy(timeout=30):
     """Poll until container is up or timeout. Returns True if healthy."""
     for i in range(timeout):
         # Check Docker availability on first iteration to fail fast
-        if i == 0 and not _docker_running():
-            log.debug("Docker not running, aborting wait_healthy")
+        if i == 0:
+            ok, reason = _docker_status()
+            if not ok:
+                log.debug("Docker unavailable, aborting wait_healthy: %s", reason)
             return False
         try:
             ok, output = _run(["ps"], capture=True)

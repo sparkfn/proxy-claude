@@ -138,13 +138,8 @@ def cmd_login(provider_name=None):
         return
 
     auth_type = _choose_auth_type(provider)
-    login_status, msg = provider.login(auth_type)
-    if login_status == AuthStatus.OK:
-        print(f"\n  ✓ {msg}")
-    elif login_status == AuthStatus.UNVERIFIED:
-        print(f"\n  ? {msg}")
-    else:
-        print(f"\n  ✗ {msg}")
+    result = _print_login_result(*provider.login(auth_type))
+    if result not in (AuthStatus.OK, AuthStatus.UNVERIFIED):
         sys.exit(1)
 
 
@@ -175,21 +170,28 @@ def _choose_auth_type(provider):
         sys.exit(1)
 
 
+def _print_login_result(login_status, msg):
+    """Print login result with status icon. Returns the status for caller control flow."""
+    if login_status == AuthStatus.OK:
+        print(f"\n  \u2713 {msg}")
+    elif login_status == AuthStatus.UNVERIFIED:
+        print(f"\n  ? {msg}")
+    else:
+        print(f"\n  \u2717 {msg}")
+    return login_status
+
+
 def _ensure_authenticated(provider, auth_type):
     """Check auth and login if needed. Exits on failure."""
     status, msg = provider.validate()
     if status == AuthStatus.OK:
         return
     print(f"\n  Need to authenticate with {provider.display_name}.")
-    login_status, msg = provider.login(auth_type)
-    if login_status == AuthStatus.OK:
-        print(f"  \u2713 {msg}")
-    elif login_status == AuthStatus.UNVERIFIED:
-        print(f"  ? {msg}")
+    result = _print_login_result(*provider.login(auth_type))
+    if result == AuthStatus.UNVERIFIED:
         print(f"  Aborting \u2014 cannot add models with unverified auth.")
         sys.exit(1)
-    else:
-        print(f"\n  {msg}")
+    elif result != AuthStatus.OK:
         sys.exit(1)
 
 

@@ -261,16 +261,21 @@ class OpenAIProvider(BaseProvider):
             # if chatgpt/ models are now being served after login
             if chatgpt_aliases:
                 found, err = self._check_proxy_models(chatgpt_aliases)
-                if err:
-                    log.debug("Proxy model check failed during login poll: %s", err)
                 if found:
                     print("\n  ? Browser OAuth may be active (models detected in proxy, not independently verified)")
                     return AuthStatus.UNVERIFIED, "Browser OAuth may be active (models detected in proxy, not independently verified)"
+                if err:
+                    log.debug("Proxy model check failed during login poll: %s", err)
+                    poll_note = f" (proxy: {err})"
+                else:
+                    poll_note = ""
+            else:
+                poll_note = ""
 
             elapsed = int(time.time() - start)
             remaining = timeout - elapsed
             mins, secs = divmod(remaining, 60)
-            print(f"\r  Polling... {mins}:{secs:02d} remaining  ", end="", flush=True)
+            print(f"\r  Polling... {mins}:{secs:02d} remaining{poll_note}  ", end="", flush=True)
             time.sleep(3)
 
         print()
