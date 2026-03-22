@@ -343,6 +343,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 body = strip_system(body)
 
+        # Extract model name for logging
+        _model = ""
+        if method == "POST" and body:
+            try:
+                _model = json.loads(body).get("model", "")
+            except (ValueError, TypeError):
+                pass
+        _t0 = time.time()
+
         conn = http.client.HTTPConnection(LITELLM_HOST, LITELLM_PORT, timeout=CONNECT_TIMEOUT)
         try:
             headers = {k: v for k, v in self.headers.items()
@@ -359,6 +368,10 @@ class Handler(BaseHTTPRequestHandler):
             conn.request(method, self.path, body=body if method in ("POST", "PUT", "PATCH") else None, headers=headers)
             conn.sock.settimeout(READ_TIMEOUT)
             resp = conn.getresponse()
+            _t1 = time.time()
+            _xlate = " [translated]" if translate_response else ""
+            log.info("%s %s model=%s status=%d %.1fs%s",
+                     method, self.path, _model or "-", resp.status, _t1 - _t0, _xlate)
 
             if _is_streaming(resp):
                 self._stream_response(resp, conn)
