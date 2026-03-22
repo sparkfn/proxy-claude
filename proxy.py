@@ -18,14 +18,16 @@ import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+import logging
+
+log = logging.getLogger("litellm-proxy")
 
 
 def _parse_size(value, default):
     """Parse a human-readable size string (e.g. '10MB', '512KB', '1GB') to bytes.
 
     Accepts B, KB, MB, GB suffixes (case-insensitive). Raw integers treated as bytes.
-    Returns default with a stderr warning on invalid input.
+    Returns default with a warning on invalid input.
     """
     if not value:
         return default
@@ -36,7 +38,7 @@ def _parse_size(value, default):
         num = float(match.group(1))
         unit = (match.group(2) or "B").upper()
         return int(num * multipliers[unit])
-    print(f"Warning: invalid size '{value}', using default {default}", file=sys.stderr, flush=True)
+    log.warning("Invalid size '%s', using default %d", value, default)
     return default
 
 
@@ -48,7 +50,7 @@ def _env_int(name, default):
     try:
         return int(val)
     except ValueError:
-        print(f"Warning: invalid integer for {name}='{val}', using default {default}", file=sys.stderr, flush=True)
+        log.warning("Invalid integer for %s='%s', using default %d", name, val, default)
         return default
 
 
@@ -76,6 +78,9 @@ _COUNTERS = {
 
 
 def _print_counters():
+    # Uses print() instead of log.warning() because atexit handlers run during
+    # interpreter shutdown after logging.shutdown() has flushed and closed all
+    # handlers. log calls here would be silently dropped.
     if any(_COUNTERS.values()):
         print(f"Proxy counters: {_COUNTERS}", file=sys.stderr, flush=True)
 
@@ -175,6 +180,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _try_send_error(self, status_code, message):
+        """Send error response, logging if client already disconnected."""
+        try:
+            self._send_error(status_code, message)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            log.debug("Client disconnected before %d response could be sent", status_code)
+
     def _proxy(self, method):
         raw_cl = self.headers.get("Content-Length")
         if raw_cl is None:
@@ -234,12 +246,18 @@ class Handler(BaseHTTPRequestHandler):
                     self._stream_response(resp, conn)
                 else:
                     self._buffer_response(resp, conn)
-        except Exception as e:
-            print(f"Proxy upstream error: {e}", file=sys.stderr, flush=True)
-            try:
-                self._send_error(502, "Upstream proxy error")
-            except Exception:
-                pass
+        except socket.timeout as e:
+            log.warning("Upstream timeout for %s %s: %s", method, self.path, e)
+            self._try_send_error(504, "Upstream timeout")
+        except ConnectionRefusedError as e:
+            log.error("Upstream refused for %s %s: %s", method, self.path, e)
+            self._try_send_error(502, "Upstream connection refused")
+        except http.client.HTTPException as e:
+            log.error("Upstream HTTP error for %s %s: %s", method, self.path, e)
+            self._try_send_error(502, "Upstream HTTP error")
+        except OSError as e:
+            log.error("Upstream I/O error for %s %s: %s", method, self.path, e)
+            self._try_send_error(502, "Upstream I/O error")
         finally:
             conn.close()
 
@@ -252,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
                 break
             buf.extend(chunk)
             if len(buf) > MAX_RESPONSE_BODY:
-                print(f"Upstream response exceeded {MAX_RESPONSE_BODY} bytes, aborting", file=sys.stderr, flush=True)
+                log.warning("Upstream response exceeded %d bytes for %s", MAX_RESPONSE_BODY, self.path)
                 self._send_error(502, "Upstream response too large")
                 return
         self.send_response(resp.status)
@@ -279,15 +297,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             resp.fp.raw._sock.settimeout(STREAM_IDLE_TIMEOUT)
         except (AttributeError, TypeError) as e:
-            print(f"Warning: could not set stream idle timeout on upstream socket "
-                  f"(idle timeout protection is NOT active): {e}",
-                  file=sys.stderr, flush=True)
+            log.warning("Could not set stream idle timeout: %s (protection inactive)", e)
             _COUNTERS["idle_timeout_inactive"] += 1
             fallback_timeout = min(STREAM_IDLE_TIMEOUT, 60)
             try:
                 conn.sock.settimeout(fallback_timeout)
-            except Exception:
-                pass
+            except (AttributeError, OSError) as fallback_err:
+                log.warning("Fallback stream timeout also failed: %s", fallback_err)
 
         start_time = time.monotonic()
         total_streamed = 0
@@ -295,7 +311,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 if time.monotonic() - start_time > MAX_STREAM_LIFETIME:
-                    print(f"Stream lifetime exceeded ({MAX_STREAM_LIFETIME}s), aborting", file=sys.stderr, flush=True)
+                    log.warning("Stream lifetime exceeded %ds for %s", MAX_STREAM_LIFETIME, self.path)
                     budget_killed = True
                     _COUNTERS["stream_budget_killed"] += 1
                     break
@@ -304,7 +320,7 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 total_streamed += len(chunk)
                 if total_streamed > MAX_STREAM_BYTES:
-                    print(f"Stream byte budget exceeded ({MAX_STREAM_BYTES} bytes), aborting", file=sys.stderr, flush=True)
+                    log.warning("Stream byte budget exceeded %d for %s", MAX_STREAM_BYTES, self.path)
                     budget_killed = True
                     _COUNTERS["stream_budget_killed"] += 1
                     break
@@ -316,13 +332,13 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
-                except Exception:
-                    pass
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    log.debug("Could not send stream terminator: %s", e)
         except socket.timeout:
-            print(f"Stream idle timeout ({STREAM_IDLE_TIMEOUT}s), aborting", file=sys.stderr, flush=True)
+            log.warning("Stream idle timeout %ds for %s", STREAM_IDLE_TIMEOUT, self.path)
             _COUNTERS["truncated_stream"] += 1
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            log.debug("Client disconnected during stream: %s", e)
 
     def do_POST(self):
         self._proxy("POST")
@@ -331,7 +347,7 @@ class Handler(BaseHTTPRequestHandler):
         self._proxy("GET")
 
     def log_message(self, fmt, *args):
-        pass
+        log.debug(fmt, *args)
 
 
 class BoundedThreadServer(HTTPServer):
@@ -353,8 +369,8 @@ class BoundedThreadServer(HTTPServer):
                     b"Connection: close\r\n\r\n"
                     b'{"error":{"message":"Server overloaded","type":"proxy_error"}}'
                 )
-            except Exception:
-                pass
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # Best-effort reject; client may already be gone
             self.shutdown_request(req)
             return
         self._pool.submit(self._handle, req, addr)
@@ -364,7 +380,7 @@ class BoundedThreadServer(HTTPServer):
             req.settimeout(SOCKET_TIMEOUT)
             self.finish_request(req, addr)
         except Exception as e:
-            print(f"Proxy request error: {e}", file=sys.stderr, flush=True)
+            log.error("Request handling error for %s: %s", addr, e)
         finally:
             self.shutdown_request(req)
             self._semaphore.release()
@@ -375,5 +391,9 @@ class BoundedThreadServer(HTTPServer):
 
 
 if __name__ == "__main__":
-    print(f"Proxy :{LISTEN_PORT} -> LiteLLM :{LITELLM_PORT} (workers={MAX_WORKERS})", flush=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    log.info("Proxy :%d -> LiteLLM :%d (workers=%d)", LISTEN_PORT, LITELLM_PORT, MAX_WORKERS)
     BoundedThreadServer(("127.0.0.1", LISTEN_PORT), Handler).serve_forever()
