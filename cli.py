@@ -780,47 +780,52 @@ def main():
     rest = args[1:]
     log.debug("Executing command: %s %s", cmd, rest)
 
-    # --- Help check: applies to ALL commands (flat and subcommand) ---
-    if "-h" in rest or "--help" in rest or "help" in rest:
-        if cmd in SUBCOMMAND_REGISTRY:
-            _show_group_help(cmd)
-        else:
+    # --- Single-word infra commands (take no args, so any -h/--help means help) ---
+    if cmd in ("start", "stop", "restart", "status", "logs"):
+        if any(a in ("-h", "--help") for a in rest):
             show_help()
-        return
+            return
+        if cmd == "start":
+            import container
+            s, msg = container.up()
+            print(f"  {'\u2713' if s == Status.OK else '\u2717'} {msg}")
+            if s != Status.OK:
+                sys.exit(1)
+        elif cmd == "stop":
+            import container
+            s, msg = container.down()
+            if s != Status.OK:
+                print(f"  \u2717 {msg}")
+                sys.exit(1)
+        elif cmd == "restart":
+            import container
+            s, msg = container.restart()
+            if s != Status.OK:
+                print(f"  \u2717 {msg}")
+                sys.exit(1)
+        elif cmd == "status":
+            cmd_status()
+        elif cmd == "logs":
+            import container
+            container.logs()
 
-    # --- Single-word infra commands ---
-    if cmd == "start":
-        import container
-        s, msg = container.up()
-        print(f"  {'\u2713' if s == Status.OK else '\u2717'} {msg}")
-        if s != Status.OK:
-            sys.exit(1)
-    elif cmd == "stop":
-        import container
-        s, msg = container.down()
-        if s != Status.OK:
-            print(f"  \u2717 {msg}")
-            sys.exit(1)
-    elif cmd == "restart":
-        import container
-        s, msg = container.restart()
-        if s != Status.OK:
-            print(f"  \u2717 {msg}")
-            sys.exit(1)
-    elif cmd == "status":
-        cmd_status()
-    elif cmd == "logs":
-        import container
-        container.logs()
-
-    # --- Subcommand groups ---
+    # --- Subcommand groups (help only before -- boundary) ---
     elif cmd in SUBCOMMAND_REGISTRY:
-        if not rest:
+        if not rest or rest[0] in ("-h", "--help"):
             _show_group_help(cmd)
             return
 
         sub = rest[0]
         sub_rest = rest[1:]
+
+        # Check for help flags only before the -- passthrough boundary
+        for a in sub_rest:
+            if a == "--":
+                break
+            if a in ("-h", "--help"):
+                _show_group_help(cmd)
+                return
+
         provider_flag, model_flag, remaining = _parse_flags(sub_rest)
 
         entry = SUBCOMMAND_REGISTRY.get(cmd, {}).get(sub)
