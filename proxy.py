@@ -469,9 +469,8 @@ class Handler(BaseHTTPRequestHandler):
     def _stream_translated(self, resp, conn):
         """Read OpenAI SSE stream, translate each chunk to Anthropic SSE events inline.
 
-        Strips MiniMax <think>...</think> reasoning blocks so Claude Code
-        only sees the final answer. Tracks accumulated text to apply the
-        strip at content boundaries.
+        Strips MiniMax <think>...</think> reasoning blocks incrementally:
+        suppresses text while inside a think block, streams normally after.
         """
         try:
             resp.fp.raw._sock.settimeout(STREAM_IDLE_TIMEOUT)
@@ -484,18 +483,75 @@ class Handler(BaseHTTPRequestHandler):
         model_name = ""
         input_tokens = 0
         output_tokens = 0
-        accumulated_text = ""  # buffer text to strip think tags at the end
+        # Think-tag state machine: buffer text until we know we're past the think block
+        in_think = False
+        think_buf = ""  # buffers partial text that might contain <think> or </think>
+        past_think = False  # once True, no more think tags expected — stream directly
         buf = b""
         done = False
         start_time = time.monotonic()
 
         def _send_event(event_str):
-            """Send one Anthropic SSE event as a chunked frame."""
             event_bytes = event_str.encode()
             self.wfile.write(f"{len(event_bytes):x}\r\n".encode())
             self.wfile.write(event_bytes)
             self.wfile.write(b"\r\n")
             self.wfile.flush()
+
+        def _send_text_delta(text):
+            nonlocal content_started
+            if not text:
+                return
+            if not content_started:
+                content_started = True
+                _send_event(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n")
+                _send_event("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+            evt = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}
+            _send_event(f"event: content_block_delta\ndata: {json.dumps(evt)}\n\n")
+
+        def _process_text(text):
+            """Filter text through think-tag state machine. Sends clean text immediately."""
+            nonlocal in_think, think_buf, past_think
+            if past_think:
+                _send_text_delta(text)
+                return
+            think_buf += text
+            while think_buf:
+                if in_think:
+                    end_idx = think_buf.find("</think>")
+                    if end_idx >= 0:
+                        # Skip everything up to and including </think>
+                        think_buf = think_buf[end_idx + 8:]
+                        in_think = False
+                        past_think = True
+                        # Send whatever is left after the close tag
+                        remaining = think_buf.lstrip()
+                        think_buf = ""
+                        if remaining:
+                            _send_text_delta(remaining)
+                        return
+                    else:
+                        # Still inside think block, discard and wait
+                        think_buf = ""
+                        return
+                else:
+                    start_idx = think_buf.find("<think>")
+                    if start_idx >= 0:
+                        # Send any text before the tag
+                        before = think_buf[:start_idx]
+                        if before.strip():
+                            _send_text_delta(before)
+                        think_buf = think_buf[start_idx + 7:]
+                        in_think = True
+                    elif "<" in think_buf and len(think_buf) < 7:
+                        # Might be a partial "<think" — wait for more
+                        return
+                    else:
+                        # No think tag, stream directly
+                        past_think = True
+                        _send_text_delta(think_buf)
+                        think_buf = ""
+                        return
 
         try:
             while not done:
@@ -534,7 +590,6 @@ class Handler(BaseHTTPRequestHandler):
                     delta = choices[0].get("delta", {})
                     finish_reason = choices[0].get("finish_reason")
 
-                    # Emit message_start on first chunk
                     if not started:
                         started = True
                         evt = {
@@ -548,24 +603,12 @@ class Handler(BaseHTTPRequestHandler):
                         }
                         _send_event(f"event: message_start\ndata: {json.dumps(evt)}\n\n")
 
-                    # Accumulate text (we strip think tags at finish)
                     text = delta.get("content", "")
                     if text:
-                        accumulated_text += text
+                        output_tokens += 1
+                        _process_text(text)
 
                     if finish_reason:
-                        # Strip think tags from the complete accumulated response
-                        clean_text = _strip_think_tags(accumulated_text)
-                        output_tokens = output_tokens or max(1, len(clean_text) // 4)
-
-                        if clean_text:
-                            if not content_started:
-                                content_started = True
-                                _send_event(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n")
-                                _send_event("event: ping\ndata: {\"type\": \"ping\"}\n\n")
-                            evt = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": clean_text}}
-                            _send_event(f"event: content_block_delta\ndata: {json.dumps(evt)}\n\n")
-
                         if content_started:
                             _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n")
                         stop = "end_turn" if finish_reason == "stop" else finish_reason
