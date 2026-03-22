@@ -164,25 +164,56 @@ def strip_system(body_bytes):
 
 # Cache: models that need OpenAI translation (loaded once at startup)
 _OPENAI_TRANSLATED_MODELS = None
+# Cache: all configured model names (for fallback routing)
+_ALL_CONFIGURED_MODELS = None
 
 def _load_translated_models():
     """Load the set of model names that use openai/ prefix (need Anthropic→OpenAI translation).
+    Also loads all configured model names for fallback routing.
     Called once at startup, cached for all subsequent requests."""
-    global _OPENAI_TRANSLATED_MODELS
-    models = set()
+    global _OPENAI_TRANSLATED_MODELS, _ALL_CONFIGURED_MODELS
+    translated = set()
+    all_models = set()
     try:
         import yaml
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "litellm_config.yaml")
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
         for entry in cfg.get("model_list", []):
+            name = entry.get("model_name", "")
+            all_models.add(name)
             litellm_model = entry.get("litellm_params", {}).get("model", "")
             if litellm_model.startswith("openai/"):
-                models.add(entry.get("model_name", ""))
+                translated.add(name)
     except Exception:
         pass
-    _OPENAI_TRANSLATED_MODELS = models
-    log.debug("Models needing OpenAI translation: %s", models)
+    _OPENAI_TRANSLATED_MODELS = translated
+    _ALL_CONFIGURED_MODELS = all_models
+    log.debug("Models needing OpenAI translation: %s", translated)
+    log.debug("All configured models: %s", all_models)
+
+
+def _remap_model_if_needed(body_bytes):
+    """If the request targets a model that isn't configured, remap to a configured one.
+
+    Claude Code sends background requests (title gen, summarization) to models like
+    claude-haiku-4-5-20251001 which may not be configured. We remap these to the
+    first configured model so they don't 400.
+    """
+    if not _ALL_CONFIGURED_MODELS:
+        return body_bytes
+    try:
+        data = json.loads(body_bytes)
+    except (ValueError, TypeError):
+        return body_bytes
+    model = data.get("model", "")
+    if model and model not in _ALL_CONFIGURED_MODELS:
+        # Pick first configured model as fallback
+        fallback = next(iter(_ALL_CONFIGURED_MODELS))
+        log.info("Remapping unconfigured model %s → %s", model, fallback)
+        data["model"] = fallback
+        return json.dumps(data).encode()
+    return body_bytes
 
 
 def _needs_openai_translation(body_bytes):
@@ -334,6 +365,9 @@ class Handler(BaseHTTPRequestHandler):
                 _COUNTERS["invalid_request"] += 1
                 self._send_error(400, err)
                 return
+            # Remap unconfigured models to a configured fallback
+            # (Claude Code sends background requests to claude-haiku which isn't configured)
+            body = _remap_model_if_needed(body)
             if _needs_openai_translation(body):
                 # Rewrite Anthropic request to OpenAI format for openai/ models
                 body = _anthropic_to_openai(body)
