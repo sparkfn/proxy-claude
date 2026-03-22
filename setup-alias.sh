@@ -255,7 +255,11 @@ import sys; sys.path.insert(0, '${DIR}')
 from config import load_env_file
 v = load_env_file('${ENV_PATH}').get('LITELLM_MASTER_KEY', '')
 print(v)
-" 2>&1)
+" 2>/dev/null)
+  if [ \$? -ne 0 ]; then
+    echo "Error: Failed to read ${ENV_PATH} — check Python environment at ${VENV}" >&2
+    return 1
+  fi
   if [ -z "\$_mk" ]; then
     echo "Error: LITELLM_MASTER_KEY not found in ${ENV_PATH} — set it with ./litellm.sh or add it manually." >&2
     return 1

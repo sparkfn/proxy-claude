@@ -66,7 +66,7 @@ def cmd_status():
     print("Models:")
     for m in models:
         provider = providers.get_provider(m["provider"])
-        if provider and running:
+        if provider and cs == Status.OK:
             if m["provider"] not in auth_cache:
                 auth_cache[m["provider"]] = provider.validate()
             auth_status, _ = auth_cache[m["provider"]]
@@ -87,7 +87,7 @@ def cmd_status():
                 label = "invalid"
         else:
             icon = "-"
-            label = "unknown" if not running else "unknown provider"
+            label = "unknown" if cs != Status.OK else "unknown provider"
         print(f"  {m['alias']:<12} {m['provider']:<10} {icon} {label}")
 
 

@@ -43,12 +43,10 @@ class AlibabaProvider(BaseProvider):
     }
 
     def login(self, auth_type="api_key", credentials=None):
-        """Authenticate. If credentials dict provided, use it. Otherwise prompt."""
+        """Authenticate with provided credentials. Caller must prompt via login_prompts."""
         if credentials is None:
-            # Fallback for direct calls — prompt here
-            key = input("  DASHSCOPE_API_KEY: ").strip()
-        else:
-            key = credentials.get("DASHSCOPE_API_KEY", "")
+            return Status.INVALID, "No credentials provided. Use login_prompts to collect them."
+        key = credentials.get("DASHSCOPE_API_KEY", "")
         if not key:
             return Status.INVALID, "No key entered."
         config.set_env("DASHSCOPE_API_KEY", key)

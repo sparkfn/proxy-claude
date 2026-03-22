@@ -179,10 +179,10 @@ class OpenAIProvider(BaseProvider):
     }
 
     def _login_api_key(self, credentials=None):
+        """Authenticate with API key. Caller must prompt via login_prompts."""
         if credentials is None:
-            key = input("  OPENAI_API_KEY: ").strip()
-        else:
-            key = credentials.get("OPENAI_API_KEY", "")
+            return Status.INVALID, "No credentials provided. Use login_prompts to collect them."
+        key = credentials.get("OPENAI_API_KEY", "")
         if not key:
             return Status.INVALID, "No key entered."
         config.set_env("OPENAI_API_KEY", key)
