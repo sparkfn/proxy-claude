@@ -28,15 +28,13 @@ def _load_yaml():
             data = yaml.safe_load(f) or {}
     except yaml.YAMLError as e:
         log.warning("litellm_config.yaml is malformed: %s", e)
-        print(f"Warning: litellm_config.yaml is malformed: {e}")
         if os.path.exists(CONFIG_BACKUP):
-            print(f"  A backup exists at litellm_config.yaml.bak")
+            log.warning("A backup exists at litellm_config.yaml.bak")
         return MalformedConfig({"model_list": [], "general_settings": {}})
     if not isinstance(data, dict):
         log.warning("litellm_config.yaml has invalid structure (expected mapping, got %s)", type(data).__name__)
-        print(f"Warning: litellm_config.yaml has invalid structure (expected YAML mapping, got {type(data).__name__})")
         if os.path.exists(CONFIG_BACKUP):
-            print(f"  A backup exists at litellm_config.yaml.bak")
+            log.warning("A backup exists at litellm_config.yaml.bak")
         return MalformedConfig({"model_list": [], "general_settings": {}})
     if "model_list" not in data:
         data["model_list"] = []
@@ -174,6 +172,35 @@ def _strip_quotes(value):
            (value[0] == "'" and value[-1] == "'"):
             return value[1:-1]
     return value
+
+
+def load_env_file(path):
+    """Parse a .env file into a dict of key->value pairs.
+
+    - Skips blank lines and comment lines (starting with #)
+    - Splits on first '=' only (values may contain '=')
+    - Strips matching surrounding quote pairs (single or double)
+    - Returns empty dict if the file doesn't exist
+    """
+    result = {}
+    if not os.path.exists(path):
+        return result
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if "=" not in stripped:
+                    continue
+                key, _, value = stripped.partition("=")
+                key = key.strip()
+                value = _strip_quotes(value.strip())
+                if key:
+                    result[key] = value
+    except OSError as e:
+        log.warning("Cannot read env file %s: %s", path, e)
+    return result
 
 
 def get_env(key):

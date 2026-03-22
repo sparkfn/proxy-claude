@@ -5,6 +5,8 @@ import subprocess
 import sys
 import time
 
+from config import load_env_file
+
 DIR = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("litellm-cli.container")
 CONTAINER_NAME = "litellm-proxy"
@@ -40,8 +42,10 @@ def _compose_cmd():
         if result.returncode == 0:
             _cached_compose_cmd = [docker, "compose"]
             return _cached_compose_cmd
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    except FileNotFoundError:
+        log.debug("'%s compose' binary not found", docker)
+    except subprocess.TimeoutExpired:
+        log.warning("'%s compose version' timed out", docker)
     try:
         result = subprocess.run(
             ["docker-compose", "version"], capture_output=True, text=True, timeout=30
@@ -49,10 +53,14 @@ def _compose_cmd():
         if result.returncode == 0:
             _cached_compose_cmd = ["docker-compose"]
             return _cached_compose_cmd
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    _cached_compose_cmd = ["docker-compose"]
-    return _cached_compose_cmd
+    except FileNotFoundError:
+        log.debug("'docker-compose' binary not found")
+    except subprocess.TimeoutExpired:
+        log.warning("'docker-compose version' timed out")
+    raise DockerNotFoundError(
+        "Neither 'docker compose' nor 'docker-compose' found. "
+        "Install Docker Desktop or docker-compose."
+    )
 
 
 def _run(args, capture=False, stream=False):
@@ -98,40 +106,6 @@ def _check_docker():
         sys.exit(1)
 
 
-def _load_env_file(path):
-    """Parse a .env file into a dict of key→value pairs.
-
-    - Skips blank lines and comment lines (starting with #)
-    - Splits on first '=' only (values may contain '=')
-    - Strips matching surrounding quote pairs (single or double)
-    - Returns empty dict if the file doesn't exist
-    """
-    result = {}
-    if not os.path.exists(path):
-        return result
-    try:
-        with open(path, "r") as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                if "=" not in stripped:
-                    continue
-                key, _, value = stripped.partition("=")
-                key = key.strip()
-                value = value.strip()
-                # Strip matching quote pairs
-                if len(value) >= 2:
-                    if (value[0] == '"' and value[-1] == '"') or \
-                       (value[0] == "'" and value[-1] == "'"):
-                        value = value[1:-1]
-                if key:
-                    result[key] = value
-    except OSError as e:
-        log.warning("Cannot read env file %s: %s", path, e)
-    return result
-
-
 PROXY_PID_FILE = os.path.join(DIR, ".proxy.pid")
 PROXY_SCRIPT = os.path.join(DIR, "proxy.py")
 PROXY_PORT = 2555
@@ -168,7 +142,7 @@ def _start_proxy():
         return False
     # Build environment: inherit current env, overlay .env values
     env = os.environ.copy()
-    env.update(_load_env_file(os.path.join(DIR, ".env")))
+    env.update(load_env_file(os.path.join(DIR, ".env")))
     try:
         proc = subprocess.Popen(
             [python, PROXY_SCRIPT, str(PROXY_PORT)],
@@ -187,51 +161,80 @@ def _start_proxy():
     exit_code = proc.poll()
     if exit_code is not None:
         log.warning("Proxy exited immediately with code %d", exit_code)
-        try:
-            os.unlink(PROXY_PID_FILE)
-        except OSError:
-            pass
+        _unlink_pid_file()
         return False
     return True
+
+
+def _unlink_pid_file():
+    """Remove the proxy PID file."""
+    try:
+        os.unlink(PROXY_PID_FILE)
+    except OSError:
+        log.debug("Could not remove PID file %s", PROXY_PID_FILE)
 
 
 def _stop_proxy():
     """Stop the rewriter proxy if running."""
     if not os.path.exists(PROXY_PID_FILE):
         return
+
     try:
         with open(PROXY_PID_FILE) as f:
-            pid = int(f.read().strip())
-        # Verify PID is actually a proxy process before killing (guards against PID recycling)
-        if not _is_proxy_process(pid):
-            log.debug("PID %d is not a proxy process, skipping kill", pid)
-            return
+            raw = f.read().strip()
+    except OSError as e:
+        log.warning("Cannot read PID file %s: %s", PROXY_PID_FILE, e)
+        return
+
+    try:
+        pid = int(raw)
+    except ValueError:
+        log.warning("Invalid PID in %s: %r", PROXY_PID_FILE, raw)
+        _unlink_pid_file()
+        return
+
+    if not _is_proxy_process(pid):
+        log.debug("PID %d is not a proxy process, cleaning up stale PID file", pid)
+        _unlink_pid_file()
+        return
+
+    # Send SIGTERM
+    try:
         os.kill(pid, signal.SIGTERM)
         log.debug("Sent SIGTERM to proxy (pid=%d)", pid)
+    except ProcessLookupError:
+        log.debug("Proxy (pid=%d) already gone", pid)
+        _unlink_pid_file()
+        return
+    except OSError as e:
+        log.warning("Failed to send SIGTERM to proxy (pid=%d): %s", pid, e)
+        return  # Don't unlink — process may still be running
 
-        # Wait for process to die (up to 3 seconds)
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except (ProcessLookupError, OSError):
-                break  # Process is gone
-            time.sleep(0.1)
-        else:
-            # Process still alive after timeout — send SIGKILL
-            try:
-                os.kill(pid, signal.SIGKILL)
-                log.debug("Sent SIGKILL to proxy (pid=%d)", pid)
-            except (ProcessLookupError, OSError):
-                pass
-
-    except (ProcessLookupError, ValueError, OSError):
-        pass
-    finally:
+    # Wait for process to die (up to 3 seconds)
+    stopped = False
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
         try:
-            os.unlink(PROXY_PID_FILE)
-        except OSError:
-            pass
+            os.kill(pid, 0)
+        except (ProcessLookupError, OSError):
+            stopped = True
+            break
+        time.sleep(0.1)
+
+    if not stopped:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            log.debug("Sent SIGKILL to proxy (pid=%d)", pid)
+            stopped = True
+        except ProcessLookupError:
+            stopped = True
+        except OSError as e:
+            log.warning("Failed to SIGKILL proxy (pid=%d): %s", pid, e)
+
+    if stopped:
+        _unlink_pid_file()
+    else:
+        log.warning("Could not confirm proxy (pid=%d) stopped; PID file retained", pid)
 
 
 def _proxy_running():
