@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import logging
 import sys
 import os
@@ -60,7 +61,7 @@ SUBCOMMAND_REGISTRY = {
         "logout": (None, "logout [name]", "Remove provider credentials"),
     },
     "launch": {
-        "claude": (None, "claude [--provider X] [--model Y] [-- args...]", "Launch Claude Code through the proxy"),
+        "claude": (None, "claude [--provider X] [--model Y] [--thinking low|medium|high] [-- args...]", "Launch Claude Code through the proxy"),
     },
 }
 
@@ -610,13 +611,19 @@ def cmd_model_rm(provider_flag=None, model_flag=None, extra_args=None):
 
 # --- Launch commands ---
 
-def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None):
+def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thinking=None, **_kwargs):
     """Launch Claude Code through the LiteLLM proxy."""
     import shutil
     import config
     import container
 
     extra_args = extra_args or []
+
+    # Validate thinking effort
+    if thinking and thinking not in ("low", "medium", "high"):
+        print(f"  \u2717 Invalid thinking effort: {thinking}")
+        print(f"  Valid options: low, medium, high")
+        sys.exit(1)
 
     # Step 1: Check claude binary
     claude_bin = shutil.which("claude")
@@ -687,6 +694,10 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None):
     os.environ["ANTHROPIC_AUTH_TOKEN"] = master_key
     os.environ["ANTHROPIC_MODEL"] = model["alias"]
     os.environ["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = "1"
+    if thinking:
+        # Pass thinking effort to proxy via custom header
+        os.environ["ANTHROPIC_CUSTOM_HEADERS"] = json.dumps({"x-thinking-effort": thinking})
+        print(f"  Thinking effort: {thinking}")
     os.execvp(claude_bin, [claude_bin] + extra_args)
 
 
@@ -707,9 +718,11 @@ def _init_registry():
 
 
 def _parse_flags(args):
-    """Extract --provider and --model flags from args. Returns (provider, model, remaining_args)."""
+    """Extract --provider, --model, --thinking flags from args.
+    Returns (provider, model, remaining_args, extra_flags)."""
     provider = None
     model = None
+    extra_flags = {}
     remaining = []
     i = 0
     while i < len(args):
@@ -719,13 +732,16 @@ def _parse_flags(args):
         elif args[i] == "--model" and i + 1 < len(args):
             model = args[i + 1]
             i += 2
+        elif args[i] == "--thinking" and i + 1 < len(args):
+            extra_flags["thinking"] = args[i + 1]
+            i += 2
         elif args[i] == "--":
             remaining.extend(args[i + 1:])
             break
         else:
             remaining.append(args[i])
             i += 1
-    return provider, model, remaining
+    return provider, model, remaining, extra_flags
 
 
 def main():
@@ -799,7 +815,7 @@ def main():
                 _show_group_help(cmd)
                 return
 
-        provider_flag, model_flag, remaining = _parse_flags(sub_rest)
+        provider_flag, model_flag, remaining, extra_flags = _parse_flags(sub_rest)
 
         entry = SUBCOMMAND_REGISTRY.get(cmd, {}).get(sub)
         if not entry or entry[0] is None:
@@ -808,7 +824,7 @@ def main():
             sys.exit(1)
 
         handler = entry[0]
-        handler(provider_flag=provider_flag, model_flag=model_flag, extra_args=remaining)
+        handler(provider_flag=provider_flag, model_flag=model_flag, extra_args=remaining, **extra_flags)
 
     else:
         print(f"  Unknown command: {cmd}")

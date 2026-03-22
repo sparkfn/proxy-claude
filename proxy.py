@@ -228,7 +228,7 @@ def _needs_openai_translation(body_bytes):
     return data.get("model", "") in _OPENAI_TRANSLATED_MODELS
 
 
-def _anthropic_to_openai(body_bytes):
+def _anthropic_to_openai(body_bytes, thinking_effort=None):
     """Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions format.
 
     Handles: system messages, text content, tool definitions, tool_use (assistant),
@@ -334,6 +334,10 @@ def _anthropic_to_openai(body_bytes):
         openai_body["temperature"] = data["temperature"]
     if data.get("stream"):
         openai_body["stream"] = True
+
+    # Inject thinking/reasoning effort if set
+    if thinking_effort:
+        openai_body["reasoning_effort"] = thinking_effort
 
     # Convert Anthropic tools → OpenAI tools
     tools = data.get("tools")
@@ -486,11 +490,13 @@ class Handler(BaseHTTPRequestHandler):
             # (Claude Code sends background requests to claude-haiku which isn't configured)
             body = _remap_model_if_needed(body)
             if _needs_openai_translation(body):
+                # Read thinking effort from custom header
+                thinking = self.headers.get("x-thinking-effort")
                 # Rewrite Anthropic request to OpenAI format for openai/ models
-                body = _anthropic_to_openai(body)
+                body = _anthropic_to_openai(body, thinking_effort=thinking)
                 self.path = "/v1/chat/completions"
                 translate_response = True
-                log.debug("Translated Anthropic→OpenAI for %s", self.path)
+                log.debug("Translated Anthropic→OpenAI for %s (thinking=%s)", self.path, thinking or "default")
             else:
                 body = strip_system(body)
 
