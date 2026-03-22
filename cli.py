@@ -615,7 +615,6 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None):
     import shutil
     import config
     import container
-    import providers
 
     extra_args = extra_args or []
 
@@ -638,70 +637,41 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None):
             print("  \u2717 Container not healthy after startup")
             sys.exit(1)
 
-    # Step 3: Pick provider (only authenticated ones)
-    all_provs = providers.all_providers()
+    # Step 3: Pick model — skip provider validation for speed
     configured_models = config.list_models()
 
-    if provider_flag:
-        provider = providers.get_provider(provider_flag)
-        if not provider:
-            print(f"  Unknown provider: {provider_flag}")
-            sys.exit(1)
-    else:
-        # Find providers that have configured models and are authenticated
-        ready = []
-        for p in all_provs:
-            p_models = [m for m in configured_models if m["provider"] == p.name]
-            if not p_models:
-                continue
-            s, _ = p.validate()
-            if s in (Status.OK, Status.UNVERIFIED):
-                ready.append(p)
-
-        if not ready:
-            print("  \u2717 No authenticated providers with configured models.")
-            print("    Run: ./litellm.sh provider login <name>")
-            print("    Then: ./litellm.sh model add")
-            sys.exit(1)
-
-        if len(ready) == 1:
-            provider = ready[0]
-        else:
-            print("\n  Select a provider:\n")
-            for i, p in enumerate(ready, 1):
-                print(f"    [{i}] {p.display_name}")
-            print()
-            choice = input("  Choose: ").strip()
-            try:
-                provider = ready[int(choice) - 1]
-            except (ValueError, IndexError):
-                print("  Invalid choice.")
-                sys.exit(1)
-
-    # Step 4: Pick model
-    p_models = [m for m in configured_models if m["provider"] == provider.name]
-    if not p_models:
-        print(f"  \u2717 No models configured for {provider.display_name}.")
-        print(f"    Run: ./litellm.sh model add --provider {provider.name}")
+    if not configured_models:
+        print("  \u2717 No models configured.")
+        print("    Run: ./litellm.sh model add")
         sys.exit(1)
 
+    # Filter by provider flag if given
+    if provider_flag:
+        candidates = [m for m in configured_models if m["provider"] == provider_flag]
+        if not candidates:
+            print(f"  \u2717 No models configured for provider '{provider_flag}'.")
+            sys.exit(1)
+    else:
+        candidates = configured_models
+
+    # Filter by model flag if given
     if model_flag:
-        match = [m for m in p_models if m["alias"] == model_flag]
+        match = [m for m in candidates if m["alias"] == model_flag]
         if not match:
-            print(f"  \u2717 Model '{model_flag}' not found for {provider.display_name}.")
-            print(f"  Available: {', '.join(m['alias'] for m in p_models)}")
+            print(f"  \u2717 Model '{model_flag}' not found.")
+            print(f"  Available: {', '.join(m['alias'] for m in candidates)}")
             sys.exit(1)
         model = match[0]
-    elif len(p_models) == 1:
-        model = p_models[0]
+    elif len(candidates) == 1:
+        model = candidates[0]
     else:
         print(f"\n  Select a model:\n")
-        for i, m in enumerate(p_models, 1):
-            print(f"    [{i}] {m['alias']}")
+        for i, m in enumerate(candidates, 1):
+            print(f"    [{i}] {m['alias']} ({m['provider']})")
         print()
         choice = input("  Choose: ").strip()
         try:
-            model = p_models[int(choice) - 1]
+            model = candidates[int(choice) - 1]
         except (ValueError, IndexError):
             print("  Invalid choice.")
             sys.exit(1)
@@ -710,8 +680,8 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None):
     master_key = config.get_env("LITELLM_MASTER_KEY") or "sk-1234"
 
     # Step 6: Launch
-    log.debug("Launching Claude Code: provider=%s model=%s", provider.name, model["alias"])
-    print(f"  Launching Claude Code ({model['alias']} via {provider.display_name})...")
+    log.debug("Launching Claude Code: model=%s provider=%s", model["alias"], model["provider"])
+    print(f"  Launching Claude Code ({model['alias']})...")
 
     os.environ["ANTHROPIC_BASE_URL"] = f"http://localhost:{PORT}"
     os.environ["ANTHROPIC_AUTH_TOKEN"] = master_key

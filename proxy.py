@@ -162,30 +162,39 @@ def strip_system(body_bytes):
     return json.dumps(data).encode()
 
 
-def _needs_openai_translation(body_bytes):
-    """Check if this Anthropic /v1/messages request targets a model that
-    needs OpenAI-compatible translation (e.g. MiniMax via openai/ prefix).
-    Reads litellm_config.yaml to check the model's litellm prefix."""
-    try:
-        data = json.loads(body_bytes)
-    except (ValueError, TypeError):
-        return False
-    model = data.get("model", "")
-    # Check litellm_config.yaml for this model's litellm prefix
+# Cache: models that need OpenAI translation (loaded once at startup)
+_OPENAI_TRANSLATED_MODELS = None
+
+def _load_translated_models():
+    """Load the set of model names that use openai/ prefix (need Anthropic→OpenAI translation).
+    Called once at startup, cached for all subsequent requests."""
+    global _OPENAI_TRANSLATED_MODELS
+    models = set()
     try:
         import yaml
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "litellm_config.yaml")
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
         for entry in cfg.get("model_list", []):
-            if entry.get("model_name") == model:
-                litellm_model = entry.get("litellm_params", {}).get("model", "")
-                # chatgpt/ models have native Anthropic support in LiteLLM
-                if litellm_model.startswith("openai/"):
-                    return True
+            litellm_model = entry.get("litellm_params", {}).get("model", "")
+            if litellm_model.startswith("openai/"):
+                models.add(entry.get("model_name", ""))
     except Exception:
         pass
-    return False
+    _OPENAI_TRANSLATED_MODELS = models
+    log.debug("Models needing OpenAI translation: %s", models)
+
+
+def _needs_openai_translation(body_bytes):
+    """Check if this Anthropic /v1/messages request targets a model that
+    needs OpenAI-compatible translation (e.g. MiniMax via openai/ prefix)."""
+    if not _OPENAI_TRANSLATED_MODELS:
+        return False
+    try:
+        data = json.loads(body_bytes)
+    except (ValueError, TypeError):
+        return False
+    return data.get("model", "") in _OPENAI_TRANSLATED_MODELS
 
 
 def _anthropic_to_openai(body_bytes):
@@ -516,4 +525,5 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     log.info("Proxy :%d -> LiteLLM :%d (workers=%d)", LISTEN_PORT, LITELLM_PORT, MAX_WORKERS)
+    _load_translated_models()
     BoundedThreadServer(("127.0.0.1", LISTEN_PORT), Handler).serve_forever()
