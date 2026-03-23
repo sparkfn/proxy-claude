@@ -59,13 +59,13 @@ LITELLM_HOST = os.environ.get("PROXY_LITELLM_HOST", "localhost")
 LITELLM_PORT = _env_int("PROXY_LITELLM_PORT", 4000)
 LISTEN_PORT = _env_int("PROXY_LISTEN_PORT", int(sys.argv[1]) if len(sys.argv) > 1 else 2555)
 MAX_WORKERS = _env_int("PROXY_MAX_WORKERS", 20)
-MAX_REQUEST_BODY = _parse_size(os.environ.get("PROXY_MAX_REQUEST_BODY"), 10 * 1024**2)   # 10MB
+MAX_REQUEST_BODY = _parse_size(os.environ.get("PROXY_MAX_REQUEST_BODY"), 100 * 1024**2)  # 100MB
 MAX_RESPONSE_BODY = _parse_size(os.environ.get("PROXY_MAX_RESPONSE_BODY"), 50 * 1024**2)  # 50MB
 CONNECT_TIMEOUT = _env_int("PROXY_CONNECT_TIMEOUT", 10)
 READ_TIMEOUT = _env_int("PROXY_READ_TIMEOUT", 300)
-STREAM_IDLE_TIMEOUT = _env_int("PROXY_STREAM_IDLE_TIMEOUT", 60)
-MAX_STREAM_LIFETIME = _env_int("PROXY_MAX_STREAM_LIFETIME", 3600)  # 60 min
-MAX_STREAM_BYTES = _parse_size(os.environ.get("PROXY_MAX_STREAM_BYTES"), 100 * 1024**2)  # 100MB
+STREAM_IDLE_TIMEOUT = _env_int("PROXY_STREAM_IDLE_TIMEOUT", 900)  # 15 min
+MAX_STREAM_LIFETIME = _env_int("PROXY_MAX_STREAM_LIFETIME", 21600)  # 6 hours
+MAX_STREAM_BYTES = _parse_size(os.environ.get("PROXY_MAX_STREAM_BYTES"), 250 * 1024**2)  # 250MB
 SOCKET_TIMEOUT = _env_int("PROXY_SOCKET_TIMEOUT", 30)
 
 
@@ -678,6 +678,8 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 data = resp.read(4096)
                 if not data:
+                    log.debug("Translated stream EOF (started=%s, done=%s, in_think=%s, tokens=%d)",
+                              started, done, in_think, output_tokens)
                     break
                 buf += data
                 while b"\n" in buf:
@@ -687,6 +689,7 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     data_str = line_str[6:].strip()
                     if data_str == "[DONE]":
+                        log.debug("Translated stream [DONE] (in_think=%s, tokens=%d)", in_think, output_tokens)
                         done = True
                         break
                     try:
@@ -775,7 +778,8 @@ class Handler(BaseHTTPRequestHandler):
                         _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
 
         except (socket.timeout, BrokenPipeError, ConnectionResetError, OSError) as e:
-            log.debug("Translated stream ended: %s", e)
+            log.warning("Translated stream ended abnormally: %s (started=%s, done=%s, in_think=%s, output_tokens=%d)",
+                        e, started, done, in_think, output_tokens)
         finally:
             try:
                 self.wfile.write(b"0\r\n\r\n")
@@ -907,7 +911,7 @@ class BoundedThreadServer(HTTPServer):
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     log.info("Proxy :%d -> LiteLLM :%d (workers=%d)", LISTEN_PORT, LITELLM_PORT, MAX_WORKERS)
