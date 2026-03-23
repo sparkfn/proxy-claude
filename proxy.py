@@ -74,6 +74,13 @@ _COUNTERS = {
     "idle_timeout_inactive": 0,
     "truncated_stream": 0,
     "invalid_request": 0,
+    "upstream_timeout": 0,
+    "upstream_refused": 0,
+    "upstream_http_error": 0,
+    "upstream_io_error": 0,
+    "handler_errors": 0,
+    "xlate_stream_errors": 0,
+    "xlate_stream_eof_no_finish": 0,
 }
 
 
@@ -545,15 +552,19 @@ class Handler(BaseHTTPRequestHandler):
                     self._buffer_response(resp, conn, translate_response)
         except socket.timeout as e:
             log.warning("Upstream timeout for %s %s: %s", method, self.path, e)
+            _COUNTERS["upstream_timeout"] += 1
             self._try_send_error(504, "Upstream timeout")
         except ConnectionRefusedError as e:
             log.error("Upstream refused for %s %s: %s", method, self.path, e)
+            _COUNTERS["upstream_refused"] += 1
             self._try_send_error(502, "Upstream connection refused")
         except http.client.HTTPException as e:
             log.error("Upstream HTTP error for %s %s: %s", method, self.path, e)
+            _COUNTERS["upstream_http_error"] += 1
             self._try_send_error(502, "Upstream HTTP error")
         except OSError as e:
             log.error("Upstream I/O error for %s %s: %s", method, self.path, e)
+            _COUNTERS["upstream_io_error"] += 1
             self._try_send_error(502, "Upstream I/O error")
         finally:
             conn.close()
@@ -588,8 +599,9 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             resp.fp.raw._sock.settimeout(STREAM_IDLE_TIMEOUT)
-        except (AttributeError, TypeError):
-            pass
+            log.debug("SSE xlate: idle timeout set to %ds", STREAM_IDLE_TIMEOUT)
+        except (AttributeError, TypeError) as e:
+            log.warning("SSE xlate: could not set idle timeout: %s", e)
 
         started = False
         content_block_index = 0  # tracks current content block index
@@ -598,6 +610,11 @@ class Handler(BaseHTTPRequestHandler):
         model_name = ""
         input_tokens = 0
         output_tokens = 0
+        total_bytes_read = 0
+        chunks_received = 0
+        sse_events_sent = 0
+        text_chars_sent = 0
+        text_chars_suppressed = 0  # eaten by think filter
         # Think-tag state machine
         in_think = False
         think_buf = ""
@@ -608,16 +625,19 @@ class Handler(BaseHTTPRequestHandler):
         buf = b""
         done = False
         start_time = time.monotonic()
+        last_chunk_time = start_time
 
         def _send_event(event_str):
+            nonlocal sse_events_sent
             event_bytes = event_str.encode()
             self.wfile.write(f"{len(event_bytes):x}\r\n".encode())
             self.wfile.write(event_bytes)
             self.wfile.write(b"\r\n")
             self.wfile.flush()
+            sse_events_sent += 1
 
         def _send_text_delta(text):
-            nonlocal text_block_open, content_block_index
+            nonlocal text_block_open, content_block_index, text_chars_sent
             if not text:
                 return
             if not text_block_open:
@@ -626,10 +646,11 @@ class Handler(BaseHTTPRequestHandler):
                 _send_event("event: ping\ndata: {\"type\": \"ping\"}\n\n")
             evt = {"type": "content_block_delta", "index": content_block_index, "delta": {"type": "text_delta", "text": text}}
             _send_event(f"event: content_block_delta\ndata: {json.dumps(evt)}\n\n")
+            text_chars_sent += len(text)
 
         def _process_text(text):
             """Filter text through think-tag state machine. Sends clean text immediately."""
-            nonlocal in_think, think_buf, past_think
+            nonlocal in_think, think_buf, past_think, text_chars_suppressed
             if past_think:
                 _send_text_delta(text)
                 return
@@ -638,49 +659,78 @@ class Handler(BaseHTTPRequestHandler):
                 if in_think:
                     end_idx = think_buf.find("</think>")
                     if end_idx >= 0:
-                        # Skip everything up to and including </think>
+                        suppressed = think_buf[:end_idx]
+                        text_chars_suppressed += len(suppressed)
                         think_buf = think_buf[end_idx + 8:]
                         in_think = False
                         past_think = True
-                        # Send whatever is left after the close tag
+                        log.debug("SSE xlate: </think> found, suppressed %d chars, resuming stream", text_chars_suppressed)
                         remaining = think_buf.lstrip()
                         think_buf = ""
                         if remaining:
                             _send_text_delta(remaining)
                         return
                     else:
-                        # Still inside think block, discard and wait
+                        text_chars_suppressed += len(think_buf)
                         think_buf = ""
                         return
                 else:
                     start_idx = think_buf.find("<think>")
                     if start_idx >= 0:
-                        # Send any text before the tag
                         before = think_buf[:start_idx]
                         if before.strip():
                             _send_text_delta(before)
                         think_buf = think_buf[start_idx + 7:]
                         in_think = True
+                        log.debug("SSE xlate: <think> entered, suppressing content")
                     elif "<" in think_buf and len(think_buf) < 7:
-                        # Might be a partial "<think" — wait for more
                         return
                     else:
-                        # No think tag, stream directly
                         past_think = True
                         _send_text_delta(think_buf)
                         think_buf = ""
                         return
 
+        def _log_summary(exit_reason):
+            elapsed = time.monotonic() - start_time
+            log.info("SSE xlate done: reason=%s elapsed=%.1fs model=%s chunks=%d bytes_read=%d "
+                     "sse_sent=%d text_sent=%d text_suppressed=%d tokens_in=%d tokens_out=%d "
+                     "started=%s done=%s in_think=%s finish=%s",
+                     exit_reason, elapsed, model_name, chunks_received, total_bytes_read,
+                     sse_events_sent, text_chars_sent, text_chars_suppressed,
+                     input_tokens, output_tokens,
+                     started, done, in_think, finish_reason_seen or "none")
+
+        finish_reason_seen = None
+
         try:
             while not done:
                 if time.monotonic() - start_time > MAX_STREAM_LIFETIME:
-                    log.warning("Translated stream lifetime exceeded for %s", self.path)
+                    log.warning("SSE xlate: lifetime exceeded %ds for %s", MAX_STREAM_LIFETIME, self.path)
+                    _log_summary("lifetime_exceeded")
                     break
+
                 data = resp.read(4096)
+                now = time.monotonic()
+
                 if not data:
-                    log.debug("Translated stream EOF (started=%s, done=%s, in_think=%s, tokens=%d)",
-                              started, done, in_think, output_tokens)
+                    if not done and not finish_reason_seen:
+                        log.warning("SSE xlate: upstream EOF without [DONE] or finish_reason "
+                                    "(chunks=%d, bytes=%d, in_think=%s, tokens=%d, idle=%.1fs)",
+                                    chunks_received, total_bytes_read, in_think, output_tokens,
+                                    now - last_chunk_time)
+                        _COUNTERS["xlate_stream_eof_no_finish"] += 1
+                    _log_summary("eof")
                     break
+
+                idle_gap = now - last_chunk_time
+                last_chunk_time = now
+                total_bytes_read += len(data)
+                chunks_received += 1
+
+                if idle_gap > 5.0:
+                    log.debug("SSE xlate: chunk %d after %.1fs idle (%d bytes)", chunks_received, idle_gap, len(data))
+
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
@@ -689,17 +739,19 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     data_str = line_str[6:].strip()
                     if data_str == "[DONE]":
-                        log.debug("Translated stream [DONE] (in_think=%s, tokens=%d)", in_think, output_tokens)
+                        log.debug("SSE xlate: [DONE] received (tokens=%d, in_think=%s)", output_tokens, in_think)
                         done = True
                         break
                     try:
                         chunk = json.loads(data_str)
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError) as e:
+                        log.debug("SSE xlate: unparseable chunk: %s (data=%s)", e, data_str[:200])
                         continue
 
                     if not msg_id:
                         msg_id = chunk.get("id", "msg_translated")
                         model_name = chunk.get("model", "")
+                        log.debug("SSE xlate: stream started id=%s model=%s", msg_id, model_name)
                     usage = chunk.get("usage", {})
                     if usage:
                         input_tokens = usage.get("prompt_tokens", input_tokens)
@@ -738,6 +790,7 @@ class Handler(BaseHTTPRequestHandler):
 
                         if tc_idx not in tool_calls:
                             tool_calls[tc_idx] = {"id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": ""}
+                            log.debug("SSE xlate: tool_call[%d] started name=%s", tc_idx, fn.get("name", "?"))
 
                         if fn.get("name"):
                             tool_calls[tc_idx]["name"] = fn["name"]
@@ -762,6 +815,9 @@ class Handler(BaseHTTPRequestHandler):
                             _send_event(f"event: content_block_delta\ndata: {json.dumps(evt)}\n\n")
 
                     if finish_reason:
+                        finish_reason_seen = finish_reason
+                        log.debug("SSE xlate: finish_reason=%s (tokens=%d, text_sent=%d)",
+                                  finish_reason, output_tokens, text_chars_sent)
                         # Close any open text block
                         if text_block_open:
                             _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n")
@@ -777,9 +833,13 @@ class Handler(BaseHTTPRequestHandler):
                         _send_event(f"event: message_delta\ndata: {json.dumps(evt)}\n\n")
                         _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
 
+            if done or finish_reason_seen:
+                _log_summary("complete")
+
         except (socket.timeout, BrokenPipeError, ConnectionResetError, OSError) as e:
-            log.warning("Translated stream ended abnormally: %s (started=%s, done=%s, in_think=%s, output_tokens=%d)",
-                        e, started, done, in_think, output_tokens)
+            log.warning("SSE xlate: stream error: %s [%s]", type(e).__name__, e)
+            _COUNTERS["xlate_stream_errors"] += 1
+            _log_summary("error_%s" % type(e).__name__)
         finally:
             try:
                 self.wfile.write(b"0\r\n\r\n")
@@ -898,8 +958,9 @@ class BoundedThreadServer(HTTPServer):
         try:
             req.settimeout(SOCKET_TIMEOUT)
             self.finish_request(req, addr)
-        except Exception:
-            log.error("Unhandled request error for %s", addr, exc_info=True)
+        except Exception as e:
+            log.error("Unhandled request error for %s: %s", addr, e, exc_info=True)
+            _COUNTERS["handler_errors"] += 1
         finally:
             self.shutdown_request(req)
             self._semaphore.release()
