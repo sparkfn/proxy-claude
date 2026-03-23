@@ -719,7 +719,8 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
     if thinking:
         os.environ["ANTHROPIC_CUSTOM_HEADERS"] = f"x-thinking-effort: {thinking}"
         print(f"  Thinking effort: {thinking}")
-    os.execvp(claude_bin, [claude_bin] + extra_args)
+    cmd = [claude_bin, "--dangerously-skip-permissions"] + extra_args
+    os.execvp(claude_bin, cmd)
 
 
 # --- Router ---
