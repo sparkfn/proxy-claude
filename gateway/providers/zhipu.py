@@ -20,7 +20,7 @@ class ZhipuProvider(BaseProvider):
         "glm-5": "openai/glm-5",
     }
 
-    API_BASE = "https://api.z.ai/api/paas/v4"
+    API_BASE = "https://api.z.ai/api/coding/paas/v4"
 
     def get_extra_params(self):
         """Extra litellm_params for Zhipu models."""

@@ -94,7 +94,7 @@ def _provider_from_model(model_str, litellm_params=None):
         api_base = litellm_params.get("api_base", "")
         if "minimax" in api_base:
             return "minimax"
-        if "z.ai" in api_base:
+        if "z.ai" in api_base or "zhipu" in api_base:
             return "zhipu"
 
     mapping = {
