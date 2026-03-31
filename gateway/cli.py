@@ -731,7 +731,6 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
             f.write(f"export ANTHROPIC_BASE_URL='http://localhost:{PORT}'\n")
             f.write(f"export ANTHROPIC_AUTH_TOKEN='{master_key}'\n")
             f.write(f"export ANTHROPIC_MODEL='{model['alias']}'\n")
-            f.write(f"export CLAUDE_CODE_DISABLE_1M_CONTEXT=1\n")
             if thinking:
                 f.write(f"export ANTHROPIC_CUSTOM_HEADERS='x-thinking-effort: {thinking}'\n")
             if telegram:
@@ -745,7 +744,6 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
     os.environ["ANTHROPIC_BASE_URL"] = f"http://localhost:{PORT}"
     os.environ["ANTHROPIC_AUTH_TOKEN"] = master_key
     os.environ["ANTHROPIC_MODEL"] = model["alias"]
-    os.environ["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = "1"
     if thinking:
         os.environ["ANTHROPIC_CUSTOM_HEADERS"] = f"x-thinking-effort: {thinking}"
         print(f"  Thinking effort: {thinking}")
