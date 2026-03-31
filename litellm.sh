@@ -82,7 +82,7 @@ import sys, requests
 try:
     r = requests.get('http://litellm:4000/health/readiness', timeout=2)
     sys.exit(0 if r.status_code == 200 else 1)
-except:
+except Exception:
     sys.exit(1)
 " 2>/dev/null
 }
