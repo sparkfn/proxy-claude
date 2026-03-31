@@ -15,7 +15,9 @@ import sys
 import time
 import http.client
 import socket
+import ssl
 import threading
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import logging
@@ -63,6 +65,7 @@ MAX_REQUEST_BODY = _parse_size(os.environ.get("PROXY_MAX_REQUEST_BODY"), 100 * 1
 MAX_RESPONSE_BODY = _parse_size(os.environ.get("PROXY_MAX_RESPONSE_BODY"), 50 * 1024**2)  # 50MB
 CONNECT_TIMEOUT = _env_int("PROXY_CONNECT_TIMEOUT", 10)
 READ_TIMEOUT = _env_int("PROXY_READ_TIMEOUT", 300)
+NON_STREAM_READ_TIMEOUT = _env_int("PROXY_NON_STREAM_READ_TIMEOUT", 30)
 STREAM_IDLE_TIMEOUT = _env_int("PROXY_STREAM_IDLE_TIMEOUT", 900)  # 15 min
 MAX_STREAM_LIFETIME = _env_int("PROXY_MAX_STREAM_LIFETIME", 21600)  # 6 hours
 MAX_STREAM_BYTES = _parse_size(os.environ.get("PROXY_MAX_STREAM_BYTES"), 250 * 1024**2)  # 250MB
@@ -81,24 +84,73 @@ _COUNTERS = {
     "handler_errors": 0,
     "xlate_stream_errors": 0,
     "xlate_stream_eof_no_finish": 0,
+    "circuit_breaker_rejected": 0,
 }
+_COUNTERS_LOCK = threading.Lock()
+
+
+def _inc_counter(key):
+    with _COUNTERS_LOCK:
+        _COUNTERS[key] += 1
 
 
 def _print_counters():
     # Uses print() instead of log.warning() because atexit handlers run during
     # interpreter shutdown after logging.shutdown() has flushed and closed all
     # handlers. log calls here would be silently dropped.
-    if any(_COUNTERS.values()):
-        print(f"Proxy counters: {_COUNTERS}", file=sys.stderr, flush=True)
+    with _COUNTERS_LOCK:
+        if any(_COUNTERS.values()):
+            print("Proxy counters: %s" % json.dumps(_COUNTERS, sort_keys=True), file=sys.stderr, flush=True)
 
 
 atexit.register(_print_counters)
 
 
-def _error_response(status_code, message):
+class _CircuitBreaker:
+    """Per-provider circuit breaker. Opens after consecutive failures, half-opens after cooldown."""
+
+    def __init__(self, failure_threshold=5, cooldown_seconds=30):
+        self._failure_threshold = failure_threshold
+        self._cooldown_seconds = cooldown_seconds
+        self._lock = threading.Lock()
+        # provider -> {"failures": int, "opened_at": float|None, "probe_in_flight": bool}
+        self._state = {}
+
+    def is_open(self, provider):
+        with self._lock:
+            s = self._state.get(provider)
+            if not s or s["opened_at"] is None:
+                return False
+            if time.monotonic() - s["opened_at"] >= self._cooldown_seconds:
+                if not s.get("probe_in_flight"):
+                    s["probe_in_flight"] = True
+                    log.info("Circuit half-open for %s, allowing single probe", provider)
+                    return False  # Allow this one through
+                return True  # Another probe already in flight
+            return True
+
+    def record_success(self, provider):
+        with self._lock:
+            self._state[provider] = {"failures": 0, "opened_at": None, "probe_in_flight": False}
+
+    def record_failure(self, provider):
+        with self._lock:
+            s = self._state.setdefault(provider, {"failures": 0, "opened_at": None, "probe_in_flight": False})
+            s["failures"] += 1
+            s["probe_in_flight"] = False
+            if s["failures"] >= self._failure_threshold:
+                if s["opened_at"] is None:
+                    log.warning("Circuit opened for %s after %d failures", provider, s["failures"])
+                s["opened_at"] = time.monotonic()
+
+
+_circuit = _CircuitBreaker()
+
+
+def _error_response(status_code, message, error_type="proxy_error"):
     """Build a JSON error body and return (status_code, body_bytes)."""
     return status_code, json.dumps(
-        {"error": {"message": message, "type": "proxy_error"}}
+        {"error": {"message": message, "type": error_type}}
     ).encode()
 
 
@@ -110,6 +162,9 @@ def _validate_messages(body_bytes):
         return "Request body must be valid JSON"
     if not isinstance(data, dict):
         return "Request body must be a JSON object"
+    model = data.get("model")
+    if not model or not isinstance(model, str):
+        return "model field is required and must be a string"
     messages = data.get("messages")
     if messages is None:
         return "messages field is required"
@@ -173,14 +228,34 @@ def strip_system(body_bytes):
 _OPENAI_TRANSLATED_MODELS = None
 # Cache: ordered list of configured model names (for fallback routing)
 _ALL_CONFIGURED_MODELS = None
+# Cache: model_name -> (host, base_path, api_key_env_var) for native Anthropic forwarding
+_NATIVE_ANTHROPIC_MODELS = None
 
 def _load_translated_models():
-    """Load the set of model names that use openai/ prefix (need Anthropic→OpenAI translation).
-    Also loads all configured model names for fallback routing.
+    """Load model routing tables from config + provider registry.
+
+    Populates three caches:
+    - _ALL_CONFIGURED_MODELS: ordered list of model names (first = default fallback)
+    - _OPENAI_TRANSLATED_MODELS: set of models needing Anthropic→OpenAI translation
+    - _NATIVE_ANTHROPIC_MODELS: dict of models with native Anthropic endpoints
     Called once at startup, cached for all subsequent requests."""
-    global _OPENAI_TRANSLATED_MODELS, _ALL_CONFIGURED_MODELS
+    global _OPENAI_TRANSLATED_MODELS, _ALL_CONFIGURED_MODELS, _NATIVE_ANTHROPIC_MODELS
     translated = set()
     all_models = []  # ordered list, first model is the default fallback
+    native = {}  # model_name -> {"url": parsed, "api_key_env": str}
+
+    # Build provider lookup: model_name -> provider instance
+    provider_for_model = {}
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import providers
+        for p in providers.all_providers():
+            if p.anthropic_base_url:
+                for model_name in p.models:
+                    provider_for_model[model_name] = p
+    except Exception as e:
+        log.warning("Could not load providers for native routing: %s", e)
+
     try:
         import yaml
         config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "litellm_config.yaml")
@@ -190,13 +265,29 @@ def _load_translated_models():
             name = entry.get("model_name", "")
             all_models.append(name)
             litellm_model = entry.get("litellm_params", {}).get("model", "")
-            if litellm_model.startswith("openai/"):
+
+            # Check if this model's provider has a native Anthropic endpoint
+            if name in provider_for_model:
+                p = provider_for_model[name]
+                if not p.native_auth:
+                    log.warning("Provider %s has anthropic_base_url but no native_auth — skipping native route", p.name)
+                    continue
+                api_key_env = p.native_auth.get("env")
+                auth_header = p.native_auth.get("header", "x-api-key")
+                parsed = urllib.parse.urlparse(p.anthropic_base_url)
+                native[name] = {"host": parsed.hostname, "port": parsed.port or 443,
+                                "path": parsed.path.rstrip("/"), "api_key_env": api_key_env,
+                                "auth_header": auth_header}
+                log.info("Native Anthropic route: %s → %s", name, p.anthropic_base_url)
+            elif litellm_model.startswith("openai/"):
                 translated.add(name)
     except Exception as e:
-        log.error("Failed to load litellm_config.yaml: %s — model translation disabled", e)
+        log.warning("Failed to load litellm_config.yaml: %s — model routing disabled", e)
     _OPENAI_TRANSLATED_MODELS = translated
     _ALL_CONFIGURED_MODELS = all_models
+    _NATIVE_ANTHROPIC_MODELS = native
     log.debug("Models needing OpenAI translation: %s", translated)
+    log.debug("Native Anthropic models: %s", list(native.keys()))
     log.debug("All configured models (ordered): %s", all_models)
 
 
@@ -221,6 +312,19 @@ def _remap_model_if_needed(body_bytes):
         data["model"] = fallback
         return json.dumps(data).encode()
     return body_bytes
+
+
+def _get_native_route(body_bytes):
+    """If the request targets a model with a native Anthropic endpoint, return its route dict.
+    Returns None if the model should go through LiteLLM."""
+    if not _NATIVE_ANTHROPIC_MODELS:
+        return None
+    try:
+        data = json.loads(body_bytes)
+    except (ValueError, TypeError) as e:
+        log.debug("Native route lookup: invalid JSON: %s", e)
+        return None
+    return _NATIVE_ANTHROPIC_MODELS.get(data.get("model", ""))
 
 
 def _needs_openai_translation(body_bytes):
@@ -282,7 +386,15 @@ def _anthropic_to_openai(body_bytes, thinking_effort=None):
             btype = block.get("type", "")
 
             if btype == "text":
-                text_parts.append(block.get("text", ""))
+                text_parts.append({"type": "text", "text": block.get("text", "")})
+
+            elif btype == "image":
+                # Anthropic image → OpenAI image_url (base64 data URI)
+                source = block.get("source", {})
+                media_type = source.get("media_type", "image/png")
+                b64_data = source.get("data", "")
+                if b64_data:
+                    text_parts.append({"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64_data}"}})
 
             elif btype == "tool_use":
                 # Assistant's tool call → OpenAI tool_calls
@@ -309,13 +421,20 @@ def _anthropic_to_openai(body_bytes, thinking_effort=None):
                     "content": str(result_content),
                 })
 
+        # Flatten text_parts: if all items are text-only, use a plain string;
+        # if any images are present, use the OpenAI multimodal content array.
+        has_images = any(isinstance(p, dict) and p.get("type") == "image_url" for p in text_parts)
+        if has_images:
+            flat_content = text_parts  # already in OpenAI multimodal format
+        else:
+            flat_content = "\n".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in text_parts)
+
         # Emit messages in the right order
         # OpenAI requires: assistant (with tool_calls) → tool results → user text
         if role == "assistant":
             msg_obj = {"role": "assistant"}
-            text = "\n".join(t for t in text_parts if t)
-            if text:
-                msg_obj["content"] = text
+            if isinstance(flat_content, str) and flat_content:
+                msg_obj["content"] = flat_content
             else:
                 msg_obj["content"] = None
             if tool_calls:
@@ -325,11 +444,11 @@ def _anthropic_to_openai(body_bytes, thinking_effort=None):
             # Tool results MUST come immediately after assistant's tool_calls
             for tr in tool_results:
                 messages.append(tr)
-            # Any user text goes AFTER tool results
-            if text_parts and any(t.strip() for t in text_parts):
-                messages.append({"role": "user", "content": "\n".join(text_parts)})
+            # Any user text/images go AFTER tool results
+            if text_parts:
+                messages.append({"role": "user", "content": flat_content})
         else:
-            messages.append({"role": role, "content": "\n".join(text_parts) if text_parts else ""})
+            messages.append({"role": role, "content": flat_content if text_parts else ""})
 
     openai_body = {
         "model": data.get("model"),
@@ -444,59 +563,85 @@ def _is_streaming(resp):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def _send_error(self, status_code, message):
-        code, body = _error_response(status_code, message)
+    def _send_error(self, status_code, message, error_type="proxy_error"):
+        code, body = _error_response(status_code, message, error_type)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _try_send_error(self, status_code, message):
+    def _try_send_error(self, status_code, message, error_type="proxy_error"):
         """Send error response, logging if client already disconnected."""
         try:
-            self._send_error(status_code, message)
+            self._send_error(status_code, message, error_type)
         except (BrokenPipeError, ConnectionResetError, OSError):
             log.debug("Client disconnected before %d response could be sent", status_code)
+
+    def _handle_upstream_error(self, exc, method, path, circuit_provider=None):
+        """Handle upstream connection errors with logging, counters, and optional circuit breaker."""
+        if isinstance(exc, socket.timeout):
+            log.warning("Upstream timeout for %s %s: %s", method, path, exc)
+            _inc_counter("upstream_timeout")
+            self._try_send_error(504, "Upstream timeout", "upstream_error")
+        elif isinstance(exc, ConnectionRefusedError):
+            log.error("Upstream refused for %s %s: %s", method, path, exc)
+            _inc_counter("upstream_refused")
+            self._try_send_error(502, "Upstream connection refused", "upstream_error")
+        elif isinstance(exc, http.client.HTTPException):
+            log.error("Upstream HTTP error for %s %s: %s", method, path, exc)
+            _inc_counter("upstream_http_error")
+            self._try_send_error(502, "Upstream HTTP error", "upstream_error")
+        elif isinstance(exc, OSError):
+            log.error("Upstream I/O error for %s %s: %s", method, path, exc)
+            _inc_counter("upstream_io_error")
+            self._try_send_error(502, "Upstream I/O error", "upstream_error")
+        if circuit_provider:
+            _circuit.record_failure(circuit_provider)
 
     def _proxy(self, method):
         raw_cl = self.headers.get("Content-Length")
         if raw_cl is None:
             if method in ("POST", "PUT", "PATCH"):
-                self._send_error(411, "Content-Length required")
+                self._send_error(411, "Content-Length required", "validation_error")
                 return
             length = 0
         else:
             try:
                 length = int(raw_cl)
             except ValueError:
-                self._send_error(400, "Invalid Content-Length header")
+                self._send_error(400, "Invalid Content-Length header", "validation_error")
                 return
             if length < 0:
-                self._send_error(400, "Invalid Content-Length header")
+                self._send_error(400, "Invalid Content-Length header", "validation_error")
                 return
 
         if length > MAX_REQUEST_BODY:
-            self._send_error(413, "Request body too large")
+            self._send_error(413, "Request body too large", "validation_error")
             return
 
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-            self._send_error(400, "Chunked transfer encoding is not supported")
+            self._send_error(400, "Chunked transfer encoding is not supported", "validation_error")
             return
 
         body = self.rfile.read(length) if length else b""
 
         translate_response = False
+        native_route = None
         if method == "POST" and "/v1/messages" in self.path:
             err = _validate_messages(body)
             if err:
-                _COUNTERS["invalid_request"] += 1
-                self._send_error(400, err)
+                _inc_counter("invalid_request")
+                self._send_error(400, err, "validation_error")
                 return
             # Remap unconfigured models to a configured fallback
             # (Claude Code sends background requests to claude-haiku which isn't configured)
             body = _remap_model_if_needed(body)
-            if _needs_openai_translation(body):
+            # Check routing: native Anthropic endpoint > OpenAI translation > LiteLLM passthrough
+            native_route = _get_native_route(body)
+            if native_route:
+                log.debug("Native Anthropic route for %s", self.path)
+            elif _needs_openai_translation(body):
                 # Read thinking effort from custom header
                 thinking = self.headers.get("x-thinking-effort")
                 # Rewrite Anthropic request to OpenAI format for openai/ models
@@ -516,6 +661,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         _t0 = time.time()
 
+        # --- Native Anthropic forwarding (bypass LiteLLM) ---
+        if native_route:
+            self._forward_native(method, body, native_route, _model, _t0)
+            return
+
         conn = http.client.HTTPConnection(LITELLM_HOST, LITELLM_PORT, timeout=CONNECT_TIMEOUT)
         try:
             headers = {k: v for k, v in self.headers.items()
@@ -523,14 +673,25 @@ class Handler(BaseHTTPRequestHandler):
             headers["Content-Length"] = str(len(body))
             headers["Host"] = f"{LITELLM_HOST}:{LITELLM_PORT}"
 
-            # When translating Anthropic→OpenAI, convert auth header
+            # When translating Anthropic→OpenAI, convert auth header (case-insensitive)
             if translate_response:
-                api_key = headers.pop("x-api-key", None) or headers.pop("X-Api-Key", None)
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
+                api_key_value = None
+                for k, v in self.headers.items():
+                    if k.lower() == "x-api-key":
+                        api_key_value = v
+                        break
+                # Remove all case variants of x-api-key from forwarded headers
+                headers = {k: v for k, v in headers.items() if k.lower() != "x-api-key"}
+                if api_key_value:
+                    headers["Authorization"] = "Bearer %s" % api_key_value
 
             conn.request(method, self.path, body=body if method in ("POST", "PUT", "PATCH") else None, headers=headers)
-            conn.sock.settimeout(READ_TIMEOUT)
+            # Use shorter timeout for non-streaming requests
+            try:
+                is_stream_request = json.loads(body).get("stream", False) if body else False
+            except (ValueError, TypeError):
+                is_stream_request = False
+            conn.sock.settimeout(STREAM_IDLE_TIMEOUT if is_stream_request else NON_STREAM_READ_TIMEOUT)
             resp = conn.getresponse()
             _t1 = time.time()
             _xlate = " [translated]" if translate_response else ""
@@ -550,22 +711,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._stream_response(resp, conn, translate_response)
                 else:
                     self._buffer_response(resp, conn, translate_response)
-        except socket.timeout as e:
-            log.warning("Upstream timeout for %s %s: %s", method, self.path, e)
-            _COUNTERS["upstream_timeout"] += 1
-            self._try_send_error(504, "Upstream timeout")
-        except ConnectionRefusedError as e:
-            log.error("Upstream refused for %s %s: %s", method, self.path, e)
-            _COUNTERS["upstream_refused"] += 1
-            self._try_send_error(502, "Upstream connection refused")
-        except http.client.HTTPException as e:
-            log.error("Upstream HTTP error for %s %s: %s", method, self.path, e)
-            _COUNTERS["upstream_http_error"] += 1
-            self._try_send_error(502, "Upstream HTTP error")
-        except OSError as e:
-            log.error("Upstream I/O error for %s %s: %s", method, self.path, e)
-            _COUNTERS["upstream_io_error"] += 1
-            self._try_send_error(502, "Upstream I/O error")
+        except (socket.timeout, ConnectionRefusedError, http.client.HTTPException, OSError) as e:
+            self._handle_upstream_error(e, method, self.path)
         finally:
             conn.close()
 
@@ -579,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
             buf.extend(chunk)
             if len(buf) > MAX_RESPONSE_BODY:
                 log.warning("Upstream response exceeded %d bytes for %s", MAX_RESPONSE_BODY, self.path)
-                self._send_error(502, "Upstream response too large")
+                self._send_error(502, "Upstream response too large", "upstream_error")
                 return
         if translate and resp.status == 200:
             buf = _openai_to_anthropic(bytes(buf))
@@ -590,6 +737,120 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(buf)))
         self.end_headers()
         self.wfile.write(buf)
+
+    def _forward_native(self, method, body, route, model_name, t0):
+        """Forward request directly to a provider's native Anthropic endpoint via HTTPS."""
+        host = route["host"]
+        port = route["port"]
+        base_path = route["path"]
+        api_key_env = route["api_key_env"]
+        auth_header = route.get("auth_header", "x-api-key")
+
+        # Circuit breaker: reject immediately if provider is in open state
+        if _circuit.is_open(model_name):
+            log.warning("Circuit breaker open for %s, rejecting request", model_name)
+            _inc_counter("circuit_breaker_rejected")
+            self._send_error(503, "Provider temporarily unavailable (circuit open)", "upstream_error")
+            return
+
+        # Get API key from environment (loaded by litellm.sh from .env)
+        api_key = os.environ.get(api_key_env, "") if api_key_env else None
+        if not api_key:
+            log.error("Native forward: no API key for model %s", model_name)
+            self._send_error(502, "Provider authentication not configured", "auth_error")
+            return
+
+        # Build path: base_path + original request path
+        # e.g. /anthropic + /v1/messages = /anthropic/v1/messages
+        forward_path = base_path + self.path
+        log.info("Native forward: %s %s model=%s → %s:%d%s", method, self.path, model_name, host, port, forward_path)
+
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(host, port, timeout=CONNECT_TIMEOUT, context=ctx)
+        try:
+            # Case-insensitive exclusion of hop-by-hop and auth headers
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in ("host", "content-length", "transfer-encoding",
+                                            "x-api-key", "authorization")}
+            headers["Content-Length"] = str(len(body))
+            headers["Host"] = host
+            # Add provider's API key
+            headers[auth_header] = api_key
+
+            conn.request(method, forward_path, body=body if method in ("POST", "PUT", "PATCH") else None, headers=headers)
+            # Determine if request is streaming
+            try:
+                is_stream_request = json.loads(body).get("stream", False) if body else False
+            except (ValueError, TypeError):
+                is_stream_request = False
+            conn.sock.settimeout(STREAM_IDLE_TIMEOUT if is_stream_request else NON_STREAM_READ_TIMEOUT)
+            resp = conn.getresponse()
+            _t1 = time.time()
+            log.info("Native response: %s %s model=%s status=%d %.1fs",
+                     method, forward_path, model_name, resp.status, _t1 - t0)
+
+            if resp.status >= 400:
+                _circuit.record_failure(model_name)
+                try:
+                    raw_err = resp.read(4096)
+                    log.debug("Native upstream %d raw body: %s", resp.status, raw_err.decode("utf-8", errors="replace")[:500])
+                except Exception as e:
+                    log.error("Failed to read native error body: %s", e)
+                    raw_err = b""
+                log.warning("Native upstream error %d for %s %s", resp.status, method, forward_path)
+
+                # Map upstream status to appropriate proxy status
+                if resp.status == 401 or resp.status == 403:
+                    err_code, err_body = _error_response(502, "Provider authentication failed", "auth_error")
+                elif resp.status == 429:
+                    err_code, err_body = _error_response(429, "Provider rate limited — retry later", "upstream_error")
+                elif resp.status >= 500:
+                    err_code, err_body = _error_response(502, "Provider temporarily unavailable", "upstream_error")
+                else:
+                    err_code, err_body = _error_response(502, "Provider request failed", "upstream_error")
+
+                try:
+                    self.send_response(err_code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    if resp.status == 429:
+                        retry_after = resp.getheader("Retry-After")
+                        if retry_after:
+                            self.send_header("Retry-After", retry_after)
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    log.debug("Client disconnected before native error response could be sent")
+                return
+
+            # Record success for circuit breaker
+            _circuit.record_success(model_name)
+
+            # Validate Content-Type on non-streaming success responses
+            ct = resp.getheader("Content-Type", "")
+            if resp.status == 200 and not _is_streaming(resp):
+                if "application/json" not in ct.lower() and "text/event-stream" not in ct.lower():
+                    log.warning("Native upstream returned unexpected Content-Type: %s for %s", ct, forward_path)
+                    self._send_error(502, "Provider returned unexpected content type", "upstream_error")
+                    return
+
+            if _is_streaming(resp):
+                self._stream_response(resp, conn, translate=False)
+            elif resp.getheader("Content-Length") is None:
+                self._stream_response(resp, conn, translate=False)
+            else:
+                try:
+                    upstream_cl = int(resp.getheader("Content-Length"))
+                except (TypeError, ValueError):
+                    upstream_cl = 0
+                if upstream_cl > MAX_RESPONSE_BODY:
+                    self._stream_response(resp, conn, translate=False)
+                else:
+                    self._buffer_response(resp, conn, translate=False)
+        except (socket.timeout, ConnectionRefusedError, http.client.HTTPException, OSError) as e:
+            self._handle_upstream_error(e, method, forward_path, circuit_provider=model_name)
+        finally:
+            conn.close()
 
     def _stream_translated(self, resp, conn):
         """Read OpenAI SSE stream, translate each chunk to Anthropic SSE events inline.
@@ -719,7 +980,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "(chunks=%d, bytes=%d, in_think=%s, tokens=%d, idle=%.1fs)",
                                     chunks_received, total_bytes_read, in_think, output_tokens,
                                     now - last_chunk_time)
-                        _COUNTERS["xlate_stream_eof_no_finish"] += 1
+                        _inc_counter("xlate_stream_eof_no_finish")
                     _log_summary("eof")
                     break
 
@@ -838,7 +1099,7 @@ class Handler(BaseHTTPRequestHandler):
 
         except (socket.timeout, BrokenPipeError, ConnectionResetError, OSError) as e:
             log.warning("SSE xlate: stream error: %s [%s]", type(e).__name__, e)
-            _COUNTERS["xlate_stream_errors"] += 1
+            _inc_counter("xlate_stream_errors")
             _log_summary("error_%s" % type(e).__name__)
         finally:
             try:
@@ -877,7 +1138,7 @@ class Handler(BaseHTTPRequestHandler):
             resp.fp.raw._sock.settimeout(STREAM_IDLE_TIMEOUT)
         except (AttributeError, TypeError) as e:
             log.warning("Could not set stream idle timeout: %s (protection inactive)", e)
-            _COUNTERS["idle_timeout_inactive"] += 1
+            _inc_counter("idle_timeout_inactive")
             fallback_timeout = min(STREAM_IDLE_TIMEOUT, 60)
             try:
                 conn.sock.settimeout(fallback_timeout)
@@ -892,7 +1153,7 @@ class Handler(BaseHTTPRequestHandler):
                 if time.monotonic() - start_time > MAX_STREAM_LIFETIME:
                     log.warning("Stream lifetime exceeded %ds for %s", MAX_STREAM_LIFETIME, self.path)
                     budget_killed = True
-                    _COUNTERS["stream_budget_killed"] += 1
+                    _inc_counter("stream_budget_killed")
                     break
                 chunk = resp.read(4096)
                 if not chunk:
@@ -901,7 +1162,7 @@ class Handler(BaseHTTPRequestHandler):
                 if total_streamed > MAX_STREAM_BYTES:
                     log.warning("Stream byte budget exceeded %d for %s", MAX_STREAM_BYTES, self.path)
                     budget_killed = True
-                    _COUNTERS["stream_budget_killed"] += 1
+                    _inc_counter("stream_budget_killed")
                     break
                 self.wfile.write(f"{len(chunk):x}\r\n".encode())
                 self.wfile.write(chunk)
@@ -915,7 +1176,7 @@ class Handler(BaseHTTPRequestHandler):
                     log.debug("Could not send stream terminator: %s", e)
         except socket.timeout:
             log.warning("Stream idle timeout %ds for %s", STREAM_IDLE_TIMEOUT, self.path)
-            _COUNTERS["truncated_stream"] += 1
+            _inc_counter("truncated_stream")
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             log.debug("Client disconnected during stream: %s", e)
 
@@ -946,7 +1207,7 @@ class BoundedThreadServer(HTTPServer):
                     b"Content-Type: application/json\r\n"
                     b"Content-Length: 62\r\n"
                     b"Connection: close\r\n\r\n"
-                    b'{"error":{"message":"Server overloaded","type":"proxy_error"}}'
+                    b'{"error":{"message":"Server overloaded","type":"overload_error"}}'
                 )
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 log.debug("503 overload response failed (client gone): %s", e)
@@ -960,7 +1221,7 @@ class BoundedThreadServer(HTTPServer):
             self.finish_request(req, addr)
         except Exception as e:
             log.error("Unhandled request error for %s: %s", addr, e, exc_info=True)
-            _COUNTERS["handler_errors"] += 1
+            _inc_counter("handler_errors")
         finally:
             self.shutdown_request(req)
             self._semaphore.release()

@@ -37,6 +37,8 @@ class BaseProvider(ABC):
     name: str = ""
     display_name: str = ""
     supports_thinking: bool = False
+    anthropic_base_url: str = None  # Native Anthropic-compatible endpoint (bypasses LiteLLM)
+    native_auth: dict = None  # {"header": "x-api-key", "env": "MINIMAX_API_KEY"} — how proxy.py authenticates native forwarding
 
     def __init__(self):
         # Instance-level copies to prevent mutable class-level sharing

@@ -4,3 +4,4 @@ __pycache__/
 .env
 .proxy.pid
 .proxy.log
+auth/
