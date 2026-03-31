@@ -363,11 +363,14 @@ def _anthropic_to_openai(body_json, thinking_effort=None):
     messages = []
 
     # Convert system to a system message
-    system = data.pop("system", None)
+    system = data.get("system")
     if system:
         if isinstance(system, str):
             messages.append({"role": "system", "content": system})
         elif isinstance(system, list):
+            cache_blocks = [item for item in system if isinstance(item, dict) and "cache_control" in item]
+            if cache_blocks:
+                log.debug("System cache_control present but not forwarded (OpenAI-compatible endpoint)")
             text = "\n".join(
                 item.get("text", "") if isinstance(item, dict) else str(item)
                 for item in system
@@ -410,6 +413,13 @@ def _anthropic_to_openai(body_json, thinking_effort=None):
                 if b64_data:
                     text_parts.append({"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64_data}"}})
 
+            elif btype == "thinking":
+                # Claude extended thinking block — OpenAI doesn't support this type.
+                # Include the thinking text as context for the model.
+                thinking_text = block.get("thinking", "")
+                if thinking_text:
+                    text_parts.append({"type": "text", "text": thinking_text})
+
             elif btype == "tool_use":
                 # Assistant's tool call → OpenAI tool_calls
                 tool_calls.append({
@@ -425,10 +435,21 @@ def _anthropic_to_openai(body_json, thinking_effort=None):
                 # User's tool result → OpenAI tool role message
                 result_content = block.get("content", "")
                 if isinstance(result_content, list):
-                    result_content = "\n".join(
-                        b.get("text", "") if isinstance(b, dict) else str(b)
-                        for b in result_content
-                    )
+                    parts = []
+                    for b in result_content:
+                        if isinstance(b, dict):
+                            if b.get("type") == "image":
+                                source = b.get("source", {})
+                                parts.append("[image: %s]" % source.get("media_type", "image/png"))
+                            else:
+                                parts.append(b.get("text", ""))
+                        else:
+                            parts.append(str(b))
+                    result_content = "\n".join(parts)
+                # Preserve error status — OpenAI has no is_error field,
+                # so prepend marker so the model knows the tool failed
+                if block.get("is_error"):
+                    result_content = "[ERROR] %s" % result_content
                 tool_results.append({
                     "role": "tool",
                     "tool_call_id": block.get("tool_use_id", ""),
@@ -468,12 +489,23 @@ def _anthropic_to_openai(body_json, thinking_effort=None):
         "model": data.get("model"),
         "messages": messages,
     }
-    if data.get("max_tokens"):
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("user_id"):
+        openai_body["user"] = metadata["user_id"]
+    if data.get("max_tokens") is not None:
         openai_body["max_tokens"] = data["max_tokens"]
+        openai_body["max_completion_tokens"] = data["max_tokens"]
     if data.get("temperature") is not None:
         openai_body["temperature"] = data["temperature"]
+    if data.get("top_p") is not None:
+        openai_body["top_p"] = data["top_p"]
+    if data.get("stop_sequences"):
+        openai_body["stop"] = data["stop_sequences"]
+    if data.get("top_k") is not None:
+        openai_body["top_k"] = data["top_k"]
     if data.get("stream"):
         openai_body["stream"] = True
+        openai_body["stream_options"] = {"include_usage": True}
 
     # Inject thinking/reasoning effort if set
     if thinking_effort:
@@ -484,6 +516,8 @@ def _anthropic_to_openai(body_json, thinking_effort=None):
     if tools:
         openai_tools = []
         for tool in tools:
+            if tool.get("cache_control"):
+                log.debug("Tool cache_control present but not forwarded (OpenAI-compatible endpoint)")
             openai_tools.append({
                 "type": "function",
                 "function": {
@@ -493,6 +527,26 @@ def _anthropic_to_openai(body_json, thinking_effort=None):
                 },
             })
         openai_body["tools"] = openai_tools
+
+    # Map Anthropic tool_choice → OpenAI tool_choice
+    tc = data.get("tool_choice")
+    if tc and openai_body.get("tools"):
+        tc_type = tc.get("type", "auto") if isinstance(tc, dict) else tc
+        if tc_type == "auto":
+            openai_body["tool_choice"] = "auto"
+        elif tc_type == "any":
+            openai_body["tool_choice"] = "required"
+        elif tc_type == "none":
+            openai_body["tool_choice"] = "none"
+        elif tc_type == "tool":
+            openai_body["tool_choice"] = {
+                "type": "function",
+                "function": {"name": tc.get("name", "")},
+            }
+
+    response_format = data.get("response_format")
+    if response_format:
+        openai_body["response_format"] = response_format
 
     return json.dumps(openai_body).encode()
 
@@ -516,9 +570,16 @@ def _openai_to_anthropic(response_bytes):
         finish_reason = choices[0].get("finish_reason", "stop")
 
         # Text content (fall back to reasoning_content for models like Z.AI GLM)
-        text = _strip_think_tags(msg.get("content", "") or "")
-        if not text:
-            text = _strip_think_tags(msg.get("reasoning_content", "") or "")
+        # Prefer content when present (even if empty). Fall back to reasoning
+        # only when content key is absent (None means key not in message).
+        content_text = msg.get("content")
+        reasoning_text = msg.get("reasoning_content")
+        if content_text is not None:
+            text = _strip_think_tags(content_text or "")
+        elif reasoning_text:
+            text = _strip_think_tags(reasoning_text)
+        else:
+            text = ""
         if text:
             content.append({"type": "text", "text": text})
 
@@ -538,10 +599,8 @@ def _openai_to_anthropic(response_bytes):
                     "name": fn.get("name", ""),
                     "input": args,
                 })
-        elif finish_reason == "stop":
-            stop_reason = "end_turn"
-        elif finish_reason == "length":
-            stop_reason = "max_tokens"
+        else:
+            stop_reason = _map_finish_reason(finish_reason)
 
     usage = data.get("usage", {})
     anthropic_resp = {
@@ -567,6 +626,22 @@ def _strip_think_tags(text):
     # Remove <think>...</think> blocks (including multiline)
     cleaned = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
     return cleaned.strip()
+
+
+def _map_finish_reason(finish_reason):
+    """Map OpenAI finish_reason to Anthropic stop_reason."""
+    if finish_reason == "stop":
+        return "end_turn"
+    if finish_reason in ("tool_calls", "function_call"):
+        return "tool_use"
+    if finish_reason == "length":
+        return "max_tokens"
+    if finish_reason == "content_filter":
+        log.warning("Upstream content_filter triggered — response may be truncated")
+        return "end_turn"
+    if finish_reason:
+        log.debug("Unknown finish_reason %s mapped to end_turn", finish_reason)
+    return "end_turn"
 
 
 def _is_streaming(resp):
@@ -692,6 +767,8 @@ class Handler(BaseHTTPRequestHandler):
             elif _needs_openai_translation(body_json):
                 # Read thinking effort from custom header
                 thinking = self.headers.get("x-thinking-effort")
+                # Capture stream flag BEFORE translation nullifies body_json
+                _is_stream = body_json.get("stream", False) if isinstance(body_json, dict) else False
                 # Rewrite Anthropic request to OpenAI format for openai/ models
                 body = _anthropic_to_openai(body_json, thinking_effort=thinking)
                 body_json = None
@@ -738,11 +815,15 @@ class Handler(BaseHTTPRequestHandler):
                     headers["Authorization"] = "Bearer %s" % api_key_value
 
             conn.request(method, self.path, body=body if method in ("POST", "PUT", "PATCH") else None, headers=headers)
-            # Use shorter timeout for non-streaming requests
-            try:
-                is_stream_request = body_json.get("stream", False) if isinstance(body_json, dict) else False
-            except (ValueError, TypeError):
-                is_stream_request = False
+            # Use shorter timeout for non-streaming requests.
+            # _is_stream is set before translation (when body_json may be nullified).
+            if not translate_response:
+                try:
+                    is_stream_request = body_json.get("stream", False) if isinstance(body_json, dict) else False
+                except (ValueError, TypeError):
+                    is_stream_request = False
+            else:
+                is_stream_request = _is_stream
             conn.sock.settimeout(STREAM_IDLE_TIMEOUT if is_stream_request else NON_STREAM_READ_TIMEOUT)
             resp = conn.getresponse()
             _t1 = time.time()
@@ -969,7 +1050,7 @@ class Handler(BaseHTTPRequestHandler):
                 _send_event(f"event: message_delta\ndata: {json.dumps(evt)}\n\n")
                 _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
                 finish_reason_seen = reason
-            _send_event("data: [DONE]\n\n")
+            # Anthropic protocol ends with message_stop, not [DONE]
             done = True
 
 
@@ -1072,6 +1153,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 if idle_gap > 5.0:
                     log.debug("SSE xlate: chunk %d after %.1fs idle (%d bytes)", chunks_received, idle_gap, len(data))
+                    # Keep-alive ping to prevent proxy/LB timeout
+                    _send_event("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 
                 buf += data
                 while b"\n" in buf:
@@ -1089,6 +1172,26 @@ class Handler(BaseHTTPRequestHandler):
                     except (ValueError, TypeError) as e:
                         log.debug("SSE xlate: unparseable chunk: %s (data=%s)", e, data_str[:200])
                         continue
+
+                    # Check for mid-stream error from upstream
+                    if "error" in chunk:
+                        err = chunk["error"]
+                        err_msg = err.get("message", "Unknown upstream error") if isinstance(err, dict) else str(err)
+                        log.warning("SSE xlate: mid-stream error from upstream: %s", err_msg)
+                        # Emit error as text so Claude Code sees it
+                        _process_text("\n[Upstream error: %s]" % err_msg)
+                        # Properly close the Anthropic stream
+                        if text_block_open:
+                            _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n")
+                            content_block_index += 1
+                            text_block_open = False
+                        stop = _map_finish_reason("stop")
+                        evt = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}}
+                        _send_event(f"event: message_delta\ndata: {json.dumps(evt)}\n\n")
+                        _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+                        finish_reason_seen = "error"
+                        done = True
+                        break
 
                     if not msg_id:
                         msg_id = chunk.get("id", "msg_translated")
@@ -1119,9 +1222,17 @@ class Handler(BaseHTTPRequestHandler):
                         _send_event(f"event: message_start\ndata: {json.dumps(evt)}\n\n")
 
                     # Handle text content (fall back to reasoning_content for Z.AI GLM)
-                    text = delta.get("content", "") or delta.get("reasoning_content", "")
+                    # Prefer content when present (even if empty). Fall back to reasoning
+                    # only when content key is absent (None means key not in delta).
+                    content_val = delta.get("content")
+                    reasoning_val = delta.get("reasoning_content")
+                    if content_val is not None:
+                        text = content_val
+                    elif reasoning_val:
+                        text = reasoning_val
+                    else:
+                        text = ""
                     if text:
-                        output_tokens += 1
                         _process_text(text)
 
                     # Handle tool calls
@@ -1169,8 +1280,9 @@ class Handler(BaseHTTPRequestHandler):
                         for tc_idx in sorted(tool_blocks_started):
                             block_idx = content_block_index + tc_idx
                             _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n")
+                        tool_blocks_started.clear()
 
-                        stop = "end_turn" if finish_reason == "stop" else "tool_use" if finish_reason == "tool_calls" else finish_reason
+                        stop = "tool_use" if tool_calls else _map_finish_reason(finish_reason)
                         evt = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}}
                         _send_event(f"event: message_delta\ndata: {json.dumps(evt)}\n\n")
                         _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
