@@ -597,7 +597,13 @@ def _openai_to_anthropic(response_bytes):
                 except (ValueError, TypeError):
                     log.warning("Malformed tool arguments from upstream (tool=%s): %s",
                                 fn.get("name", "?"), raw_args[:200])
-                    args = {}
+                    # Fail closed: emit error text instead of fake tool_use
+                    content.append({
+                        "type": "text",
+                        "text": "[Tool call failed: malformed arguments for %s]" % fn.get("name", "unknown"),
+                    })
+                    stop_reason = "end_turn"
+                    continue
                 content.append({
                     "type": "tool_use",
                     "id": tc.get("id", ""),
@@ -844,7 +850,9 @@ class Handler(BaseHTTPRequestHandler):
             log.info("%s %s model=%s status=%d %.1fs%s",
                      method, self.path, _model or _circuit_key or "-", resp.status, _t1 - _t0, _xlate)
 
-            if resp.status < 500:
+            # Circuit breaker: 2xx/3xx = success, 4xx/5xx = failure
+            # (429 rate limits and auth errors should trip the breaker)
+            if resp.status < 400:
                 _circuit.record_success(circuit_provider)
             else:
                 _circuit.record_failure(circuit_provider)
@@ -1101,7 +1109,11 @@ class Handler(BaseHTTPRequestHandler):
             sse_events_sent += 1
 
         def _send_done_and_close(reason):
+            """Emit terminal Anthropic events and mark stream as done."""
             nonlocal done, finish_reason_seen, text_block_open, content_block_index
+            if not started or finish_reason_seen:
+                done = True
+                return
             if text_block_open:
                 _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n")
                 content_block_index += 1
@@ -1110,12 +1122,12 @@ class Handler(BaseHTTPRequestHandler):
                 for tc_idx in sorted(tool_blocks_started):
                     block_idx = content_block_index + tc_idx
                     _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n")
-            if started and not finish_reason_seen:
-                evt = {"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}}
-                _send_event(f"event: message_delta\ndata: {json.dumps(evt)}\n\n")
-                _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
-                finish_reason_seen = reason
-            # Anthropic protocol ends with message_stop, not [DONE]
+                tool_blocks_started.clear()
+            stop = _map_finish_reason(reason)
+            evt = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}}
+            _send_event(f"event: message_delta\ndata: {json.dumps(evt)}\n\n")
+            _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+            finish_reason_seen = reason
             done = True
 
 
@@ -1258,7 +1270,21 @@ class Handler(BaseHTTPRequestHandler):
                         err = chunk["error"]
                         err_msg = err.get("message", "Unknown upstream error") if isinstance(err, dict) else str(err)
                         log.warning("SSE xlate: mid-stream error from upstream: %s", err_msg)
-                        # Emit error as text so Claude Code sees it
+                        # Ensure message_start was emitted (required before any events)
+                        if not started:
+                            started = True
+                            msg_id = msg_id or "msg_error"
+                            evt = {
+                                "type": "message_start",
+                                "message": {
+                                    "id": msg_id, "type": "message", "role": "assistant",
+                                    "content": [], "model": model_name or "unknown",
+                                    "stop_reason": None, "stop_sequence": None,
+                                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                                },
+                            }
+                            _send_event(f"event: message_start\ndata: {json.dumps(evt)}\n\n")
+                        # Emit error as assistant text so Claude Code sees it
                         _process_text("\n[Upstream error: %s]" % err_msg)
                         _send_done_and_close("end_turn")
                         break
