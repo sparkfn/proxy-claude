@@ -11,6 +11,7 @@ import atexit
 import json
 import os
 import re
+import signal
 import sys
 import time
 import http.client
@@ -87,11 +88,18 @@ _COUNTERS = {
     "circuit_breaker_rejected": 0,
 }
 _COUNTERS_LOCK = threading.Lock()
+_ALIVE = True
 
 
 def _inc_counter(key):
     with _COUNTERS_LOCK:
         _COUNTERS[key] += 1
+
+
+def _log_counters(level=logging.INFO):
+    with _COUNTERS_LOCK:
+        if any(_COUNTERS.values()):
+            log.log(level, "Proxy counters: %s", json.dumps(_COUNTERS, sort_keys=True))
 
 
 def _print_counters():
@@ -154,14 +162,11 @@ def _error_response(status_code, message, error_type="proxy_error"):
     ).encode()
 
 
-def _validate_messages(body_bytes):
+def _validate_messages(body_json):
     """Validate /v1/messages request schema. Returns error string or None."""
-    try:
-        data = json.loads(body_bytes)
-    except (ValueError, TypeError):
-        return "Request body must be valid JSON"
-    if not isinstance(data, dict):
+    if not isinstance(body_json, dict):
         return "Request body must be a JSON object"
+    data = body_json
     model = data.get("model")
     if not model or not isinstance(model, str):
         return "model field is required and must be a string"
@@ -176,27 +181,24 @@ def _validate_messages(body_bytes):
     return None
 
 
-def strip_system(body_bytes):
+def strip_system(body_json):
     """Remove 'system' field, merge into first user message.
 
     Caller MUST run _validate_messages() first.
-    Returns modified body bytes, or original bytes if no system field.
+    Returns modified body dict, or original dict if no system field.
     """
-    try:
-        data = json.loads(body_bytes)
-    except (ValueError, TypeError):
-        return body_bytes
+    if not isinstance(body_json, dict):
+        return body_json
 
-    if not isinstance(data, dict):
-        return body_bytes
+    data = body_json
 
     system = data.pop("system", None)
     if not system:
-        return body_bytes
+        return body_json
 
     messages = data.get("messages")
     if not isinstance(messages, list) or len(messages) == 0:
-        return body_bytes  # validation already caught this
+        return body_json  # validation already caught this
 
     if isinstance(system, str):
         text = system
@@ -221,7 +223,7 @@ def strip_system(body_bytes):
         else:
             messages.insert(0, {"role": "user", "content": text})
 
-    return json.dumps(data).encode()
+    return data
 
 
 # Cache: models that need OpenAI translation (loaded once at startup)
@@ -291,7 +293,7 @@ def _load_translated_models():
     log.debug("All configured models (ordered): %s", all_models)
 
 
-def _remap_model_if_needed(body_bytes):
+def _remap_model_if_needed(body_json):
     """If the request targets a model that isn't configured, remap to a configured one.
 
     Claude Code sends background requests (title gen, summarization) to models like
@@ -299,53 +301,47 @@ def _remap_model_if_needed(body_bytes):
     first configured model so they don't 400.
     """
     if not _ALL_CONFIGURED_MODELS:
-        return body_bytes
-    try:
-        data = json.loads(body_bytes)
-    except (ValueError, TypeError):
-        return body_bytes
+        return body_json
+    if not isinstance(body_json, dict):
+        return body_json
+    data = body_json
     model = data.get("model", "")
     if model and model not in _ALL_CONFIGURED_MODELS:
         # Pick first configured model as fallback (deterministic, config file order)
         fallback = _ALL_CONFIGURED_MODELS[0]
         log.info("Remapping unconfigured model %s → %s", model, fallback)
         data["model"] = fallback
-        return json.dumps(data).encode()
-    return body_bytes
+        return data
+    return body_json
 
 
-def _get_native_route(body_bytes):
+def _get_native_route(body_json):
     """If the request targets a model with a native Anthropic endpoint, return its route dict.
     Returns None if the model should go through LiteLLM."""
     if not _NATIVE_ANTHROPIC_MODELS:
         return None
-    try:
-        data = json.loads(body_bytes)
-    except (ValueError, TypeError) as e:
-        log.debug("Native route lookup: invalid JSON: %s", e)
+    if not isinstance(body_json, dict):
         return None
-    return _NATIVE_ANTHROPIC_MODELS.get(data.get("model", ""))
+    return _NATIVE_ANTHROPIC_MODELS.get(body_json.get("model", ""))
 
 
-def _needs_openai_translation(body_bytes):
+def _needs_openai_translation(body_json):
     """Check if this Anthropic /v1/messages request targets a model that
     needs OpenAI-compatible translation (e.g. MiniMax via openai/ prefix)."""
     if not _OPENAI_TRANSLATED_MODELS:
         return False
-    try:
-        data = json.loads(body_bytes)
-    except (ValueError, TypeError):
+    if not isinstance(body_json, dict):
         return False
-    return data.get("model", "") in _OPENAI_TRANSLATED_MODELS
+    return body_json.get("model", "") in _OPENAI_TRANSLATED_MODELS
 
 
-def _anthropic_to_openai(body_bytes, thinking_effort=None):
+def _anthropic_to_openai(body_json, thinking_effort=None):
     """Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions format.
 
     Handles: system messages, text content, tool definitions, tool_use (assistant),
     and tool_result (user) blocks for full agentic coding tool support.
     """
-    data = json.loads(body_bytes)
+    data = body_json
     messages = []
 
     # Convert system to a system message
@@ -501,8 +497,10 @@ def _openai_to_anthropic(response_bytes):
         msg = choices[0].get("message", {})
         finish_reason = choices[0].get("finish_reason", "stop")
 
-        # Text content
+        # Text content (fall back to reasoning_content for models like Z.AI GLM)
         text = _strip_think_tags(msg.get("content", "") or "")
+        if not text:
+            text = _strip_think_tags(msg.get("reasoning_content", "") or "")
         if text:
             content.append({"type": "text", "text": text})
 
@@ -600,6 +598,14 @@ class Handler(BaseHTTPRequestHandler):
             _circuit.record_failure(circuit_provider)
 
     def _proxy(self, method):
+        if method == "GET" and self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "16")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+            return
+
         raw_cl = self.headers.get("Content-Length")
         if raw_cl is None:
             if method in ("POST", "PUT", "PATCH"):
@@ -625,45 +631,62 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         body = self.rfile.read(length) if length else b""
+        body_json = None
 
         translate_response = False
         native_route = None
+        if method == "POST" and body:
+            try:
+                body_json = json.loads(body)
+                log.debug("Parsed request body for %s", self.path)
+            except (ValueError, TypeError) as e:
+                if "/v1/messages" in self.path:
+                    log.debug("Invalid JSON request body for %s: %s", self.path, e)
+                    _inc_counter("invalid_request")
+                    self._send_error(400, "Request body must be valid JSON", "validation_error")
+                    return
+                body_json = None
+
         if method == "POST" and "/v1/messages" in self.path:
-            err = _validate_messages(body)
+            err = _validate_messages(body_json)
             if err:
                 _inc_counter("invalid_request")
                 self._send_error(400, err, "validation_error")
                 return
             # Remap unconfigured models to a configured fallback
             # (Claude Code sends background requests to claude-haiku which isn't configured)
-            body = _remap_model_if_needed(body)
+            body_json = _remap_model_if_needed(body_json)
             # Check routing: native Anthropic endpoint > OpenAI translation > LiteLLM passthrough
-            native_route = _get_native_route(body)
+            native_route = _get_native_route(body_json)
             if native_route:
                 log.debug("Native Anthropic route for %s", self.path)
-            elif _needs_openai_translation(body):
+            elif _needs_openai_translation(body_json):
                 # Read thinking effort from custom header
                 thinking = self.headers.get("x-thinking-effort")
                 # Rewrite Anthropic request to OpenAI format for openai/ models
-                body = _anthropic_to_openai(body, thinking_effort=thinking)
+                body = _anthropic_to_openai(body_json, thinking_effort=thinking)
+                body_json = None
                 self.path = "/v1/chat/completions"
                 translate_response = True
                 log.debug("Translated Anthropic→OpenAI for %s (thinking=%s)", self.path, thinking or "default")
             else:
-                body = strip_system(body)
+                body_json = strip_system(body_json)
+                body = json.dumps(body_json).encode()
 
         # Extract model name for logging
-        _model = ""
-        if method == "POST" and body:
-            try:
-                _model = json.loads(body).get("model", "")
-            except (ValueError, TypeError):
-                pass
+        _model = body_json.get("model", "") if isinstance(body_json, dict) else ""
         _t0 = time.time()
 
         # --- Native Anthropic forwarding (bypass LiteLLM) ---
         if native_route:
-            self._forward_native(method, body, native_route, _model, _t0)
+            self._forward_native(method, body, native_route, _model, _t0, body_json=body_json)
+            return
+
+        circuit_provider = _model or "litellm"
+        if _circuit.is_open(circuit_provider):
+            log.warning("Circuit breaker open for %s, rejecting request", circuit_provider)
+            _inc_counter("circuit_breaker_rejected")
+            self._send_error(503, "Provider temporarily unavailable (circuit open)", "upstream_error")
             return
 
         conn = http.client.HTTPConnection(LITELLM_HOST, LITELLM_PORT, timeout=CONNECT_TIMEOUT)
@@ -688,7 +711,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.request(method, self.path, body=body if method in ("POST", "PUT", "PATCH") else None, headers=headers)
             # Use shorter timeout for non-streaming requests
             try:
-                is_stream_request = json.loads(body).get("stream", False) if body else False
+                is_stream_request = body_json.get("stream", False) if isinstance(body_json, dict) else False
             except (ValueError, TypeError):
                 is_stream_request = False
             conn.sock.settimeout(STREAM_IDLE_TIMEOUT if is_stream_request else NON_STREAM_READ_TIMEOUT)
@@ -697,6 +720,11 @@ class Handler(BaseHTTPRequestHandler):
             _xlate = " [translated]" if translate_response else ""
             log.info("%s %s model=%s status=%d %.1fs%s",
                      method, self.path, _model or "-", resp.status, _t1 - _t0, _xlate)
+
+            if resp.status < 500:
+                _circuit.record_success(circuit_provider)
+            else:
+                _circuit.record_failure(circuit_provider)
 
             if _is_streaming(resp):
                 self._stream_response(resp, conn, translate_response)
@@ -712,7 +740,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._buffer_response(resp, conn, translate_response)
         except (socket.timeout, ConnectionRefusedError, http.client.HTTPException, OSError) as e:
-            self._handle_upstream_error(e, method, self.path)
+            self._handle_upstream_error(e, method, self.path, circuit_provider=circuit_provider)
         finally:
             conn.close()
 
@@ -738,7 +766,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(buf)
 
-    def _forward_native(self, method, body, route, model_name, t0):
+    def _forward_native(self, method, body, route, model_name, t0, body_json=None):
         """Forward request directly to a provider's native Anthropic endpoint via HTTPS."""
         host = route["host"]
         port = route["port"]
@@ -780,7 +808,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.request(method, forward_path, body=body if method in ("POST", "PUT", "PATCH") else None, headers=headers)
             # Determine if request is streaming
             try:
-                is_stream_request = json.loads(body).get("stream", False) if body else False
+                is_stream_request = body_json.get("stream", False) if isinstance(body_json, dict) else False
             except (ValueError, TypeError):
                 is_stream_request = False
             conn.sock.settimeout(STREAM_IDLE_TIMEOUT if is_stream_request else NON_STREAM_READ_TIMEOUT)
@@ -897,6 +925,25 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             sse_events_sent += 1
 
+        def _send_done_and_close(reason):
+            nonlocal done, finish_reason_seen, text_block_open, content_block_index
+            if text_block_open:
+                _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n")
+                content_block_index += 1
+                text_block_open = False
+            if tool_blocks_started:
+                for tc_idx in sorted(tool_blocks_started):
+                    block_idx = content_block_index + tc_idx
+                    _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n")
+            if started and not finish_reason_seen:
+                evt = {"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}}
+                _send_event(f"event: message_delta\ndata: {json.dumps(evt)}\n\n")
+                _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+                finish_reason_seen = reason
+            _send_event("data: [DONE]\n\n")
+            done = True
+
+
         def _send_text_delta(text):
             nonlocal text_block_open, content_block_index, text_chars_sent
             if not text:
@@ -966,6 +1013,11 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             while not done:
+                if not _ALIVE:
+                    log.info("SSE xlate: shutdown requested for %s", self.path)
+                    _send_done_and_close("server_shutdown")
+                    _log_summary("shutdown")
+                    break
                 if time.monotonic() - start_time > MAX_STREAM_LIFETIME:
                     log.warning("SSE xlate: lifetime exceeded %ds for %s", MAX_STREAM_LIFETIME, self.path)
                     _log_summary("lifetime_exceeded")
@@ -1037,8 +1089,8 @@ class Handler(BaseHTTPRequestHandler):
                         }
                         _send_event(f"event: message_start\ndata: {json.dumps(evt)}\n\n")
 
-                    # Handle text content
-                    text = delta.get("content", "")
+                    # Handle text content (fall back to reasoning_content for Z.AI GLM)
+                    text = delta.get("content", "") or delta.get("reasoning_content", "")
                     if text:
                         output_tokens += 1
                         _process_text(text)
@@ -1150,6 +1202,15 @@ class Handler(BaseHTTPRequestHandler):
         budget_killed = False
         try:
             while True:
+                if not _ALIVE:
+                    log.info("Stream shutdown requested for %s", self.path)
+                    try:
+                        self.wfile.write(b"e\r\ndata: [DONE]\n\n\r\n")
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                        log.debug("Could not send shutdown terminator: %s", e)
+                    break
                 if time.monotonic() - start_time > MAX_STREAM_LIFETIME:
                     log.warning("Stream lifetime exceeded %ds for %s", MAX_STREAM_LIFETIME, self.path)
                     budget_killed = True
@@ -1168,7 +1229,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.write(b"\r\n")
                 self.wfile.flush()
-            if not budget_killed:
+            if not budget_killed and _ALIVE:
                 try:
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
@@ -1226,9 +1287,24 @@ class BoundedThreadServer(HTTPServer):
             self.shutdown_request(req)
             self._semaphore.release()
 
+    def shutdown_pool(self, timeout=10):
+        done = threading.Event()
+
+        def _shutdown():
+            self._pool.shutdown(wait=True)
+            done.set()
+
+        thread = threading.Thread(target=_shutdown, name="proxy-pool-shutdown", daemon=True)
+        thread.start()
+        finished = done.wait(timeout)
+        if finished:
+            log.info("Worker pool shutdown complete")
+        else:
+            log.warning("Worker pool shutdown timed out after %ss", timeout)
+        return finished
+
     def server_close(self):
         super().server_close()
-        self._pool.shutdown(wait=False)
 
 
 if __name__ == "__main__":
@@ -1238,4 +1314,28 @@ if __name__ == "__main__":
     )
     log.info("Proxy :%d -> LiteLLM :%d (workers=%d)", LISTEN_PORT, LITELLM_PORT, MAX_WORKERS)
     _load_translated_models()
-    BoundedThreadServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
+    server = BoundedThreadServer(("0.0.0.0", LISTEN_PORT), Handler)
+    _shutdown_state = {"requested": False}
+
+    def _graceful_shutdown(signum, _frame):
+        global _ALIVE
+        if _shutdown_state["requested"]:
+            return
+        _shutdown_state["requested"] = True
+        _ALIVE = False
+        log.info("Received signal %s, starting graceful shutdown", signum)
+        server.shutdown()
+
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        drained = server.shutdown_pool(timeout=10)
+        _log_counters(level=logging.WARNING if not drained else logging.INFO)
+        if not drained:
+            log.warning("Proxy shutdown incomplete; forcing exit")
+            raise SystemExit(1)
+        log.info("Proxy shutdown complete")
