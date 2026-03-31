@@ -616,15 +616,11 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
             print("    npm install -g @anthropic-ai/claude-code")
             sys.exit(1)
 
-    # Step 2: Check LiteLLM backend is reachable
+    # Step 2: Check LiteLLM backend (warn but don't block — proxy handles 502)
     cs, _ = container.status()
     if cs != Status.OK:
-        if emit_env:
-            _eprint("  \u2717 LiteLLM backend is not reachable")
-            sys.exit(1)
-        else:
-            print("  \u2717 LiteLLM backend is not reachable. Run './litellm.sh start' first.")
-            sys.exit(1)
+        out("  \u26a0 LiteLLM backend not yet reachable (may still be starting)")
+        out("    Claude will work once LiteLLM finishes initializing")
 
     # Step 3: Pick model — skip provider validation for speed
     configured_models = config.list_models()
