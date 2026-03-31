@@ -75,6 +75,90 @@ _ensure_docker() {
     fi
 }
 
+_litellm_healthy() {
+    # Check if LiteLLM is serving via gateway's internal network
+    docker exec "$GATEWAY_CONTAINER" python -c "
+import sys, requests
+try:
+    r = requests.get('http://litellm:4000/health', timeout=2)
+    sys.exit(0 if r.status_code == 200 else 1)
+except:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+_show_auth_prompt() {
+    # Check litellm logs for pending device code auth. Shows prompt if found.
+    # Returns 0 if auth prompt found, 1 if not.
+    local logs
+    logs=$(_docker_compose logs litellm 2>&1 | tail -30)
+
+    local url code
+    url=$(echo "$logs" | grep -oE 'https://auth\.openai\.com/[^ "]+' | tail -1)
+    code=$(echo "$logs" | grep -oE 'Enter code: [A-Z0-9]+-[A-Z0-9]+' | tail -1 | sed 's/Enter code: //')
+
+    if [ -n "$url" ] && [ -n "$code" ]; then
+        echo ""
+        echo "  ┌─────────────────────────────────────────────────────┐"
+        echo "  │  OpenAI Login Required                              │"
+        echo "  │                                                     │"
+        printf "  │  1) Visit:  %-42s│\n" "$url"
+        printf "  │  2) Enter code:  %-36s│\n" "$code"
+        echo "  │                                                     │"
+        echo "  └─────────────────────────────────────────────────────┘"
+        echo ""
+        return 0
+    fi
+    return 1
+}
+
+_wait_litellm_ready() {
+    # Wait for LiteLLM backend to be healthy. Shows auth prompt if needed.
+    # Returns 0 on success, 1 on timeout.
+    local timeout=${1:-300}
+    local auth_shown=false
+    local start=$SECONDS
+
+    # Quick check — already healthy?
+    if _litellm_healthy; then
+        return 0
+    fi
+
+    echo "  Waiting for LiteLLM backend..."
+
+    while [ $((SECONDS - start)) -lt "$timeout" ]; do
+        if _litellm_healthy; then
+            printf "\r%60s\r" ""
+            echo "  ✓ LiteLLM is ready"
+            return 0
+        fi
+
+        # Show auth prompt once if detected
+        if [ "$auth_shown" = false ] && _show_auth_prompt; then
+            auth_shown=true
+        fi
+
+        local elapsed=$((SECONDS - start))
+        local remaining=$((timeout - elapsed))
+        local mins=$((remaining / 60))
+        local secs=$((remaining % 60))
+        if [ "$auth_shown" = true ]; then
+            printf "\r  Waiting for login... %d:%02d remaining  " "$mins" "$secs"
+        else
+            printf "\r  Waiting for LiteLLM... %ds  " "$elapsed"
+        fi
+        sleep 3
+    done
+
+    echo ""
+    if [ "$auth_shown" = true ]; then
+        echo "  ✗ Login timed out. Complete the auth and run again."
+    else
+        echo "  ✗ LiteLLM did not become ready. Check './litellm.sh logs litellm'"
+    fi
+    return 1
+}
+
 # --- Launch claude (runs on host, no Python needed) ---
 # Interactive model/config selection runs inside the gateway container via
 # docker exec -it. cli.py --emit-env writes env vars to a temp file inside
@@ -102,6 +186,11 @@ _launch_claude() {
             echo "  ✗ Gateway failed to start. Check './litellm.sh logs'"
             exit 1
         fi
+    fi
+
+    # Ensure LiteLLM backend is ready (shows auth prompt if needed)
+    if ! _wait_litellm_ready 300; then
+        exit 1
     fi
 
     # Run the interactive launch flow inside the container.
@@ -212,7 +301,19 @@ case "$CMD" in
     start)
         echo "  Starting services..."
         _docker_compose up -d --build
-        echo "  ✓ Services started on http://localhost:2555"
+        # Wait for gateway container
+        local gw_wait=0
+        while ! _gateway_running && [ $gw_wait -lt 15 ]; do
+            sleep 1
+            gw_wait=$((gw_wait + 1))
+        done
+        if ! _gateway_running; then
+            echo "  ✗ Gateway failed to start. Check './litellm.sh logs'"
+            exit 1
+        fi
+        echo "  ✓ Gateway running on http://localhost:2555"
+        # Wait for LiteLLM (shows auth prompt if needed)
+        _wait_litellm_ready 300 || true
         ;;
     stop)
         _docker_compose down
