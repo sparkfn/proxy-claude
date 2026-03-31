@@ -72,6 +72,8 @@ NON_STREAM_READ_TIMEOUT = _env_int("PROXY_NON_STREAM_READ_TIMEOUT", 30)
 STREAM_IDLE_TIMEOUT = _env_int("PROXY_STREAM_IDLE_TIMEOUT", 900)  # 15 min
 MAX_STREAM_LIFETIME = _env_int("PROXY_MAX_STREAM_LIFETIME", 21600)  # 6 hours
 MAX_STREAM_BYTES = _parse_size(os.environ.get("PROXY_MAX_STREAM_BYTES"), 250 * 1024**2)  # 250MB
+MAX_SSE_LINE_BYTES = _parse_size(os.environ.get("PROXY_MAX_SSE_LINE_BYTES"), 10 * 1024**2)  # 10MB per SSE line
+MAX_SSE_TOTAL_BYTES = _parse_size(os.environ.get("PROXY_MAX_SSE_TOTAL_BYTES"), 250 * 1024**2)  # 250MB total translated stream
 SOCKET_TIMEOUT = _env_int("PROXY_SOCKET_TIMEOUT", 30)
 
 
@@ -589,9 +591,12 @@ def _openai_to_anthropic(response_bytes):
             stop_reason = "tool_use"
             for tc in tool_calls:
                 fn = tc.get("function", {})
+                raw_args = fn.get("arguments", "{}")
                 try:
-                    args = json.loads(fn.get("arguments", "{}"))
+                    args = json.loads(raw_args)
                 except (ValueError, TypeError):
+                    log.warning("Malformed tool arguments from upstream (tool=%s): %s",
+                                fn.get("name", "?"), raw_args[:200])
                     args = {}
                 content.append({
                     "type": "tool_use",
@@ -645,10 +650,15 @@ def _map_finish_reason(finish_reason):
 
 
 def _is_streaming(resp):
-    """Return True if the upstream response should be streamed to the client."""
+    """Return True if the upstream response is an SSE stream."""
     ct = resp.getheader("Content-Type", "").lower()
+    return "text/event-stream" in ct
+
+
+def _is_chunked(resp):
+    """Return True if the response uses chunked transfer encoding."""
     te = resp.getheader("Transfer-Encoding", "").lower()
-    return "text/event-stream" in ct or "chunked" in te
+    return "chunked" in te
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -739,6 +749,7 @@ class Handler(BaseHTTPRequestHandler):
 
         translate_response = False
         native_route = None
+        _circuit_key = ""
         if method == "POST" and body:
             try:
                 body_json = json.loads(body)
@@ -769,6 +780,8 @@ class Handler(BaseHTTPRequestHandler):
                 thinking = self.headers.get("x-thinking-effort")
                 # Capture stream flag BEFORE translation nullifies body_json
                 _is_stream = body_json.get("stream", False) if isinstance(body_json, dict) else False
+                # Capture model name for circuit breaker before translation clears body_json
+                _circuit_key = body_json.get("model", "") if isinstance(body_json, dict) else ""
                 # Rewrite Anthropic request to OpenAI format for openai/ models
                 body = _anthropic_to_openai(body_json, thinking_effort=thinking)
                 body_json = None
@@ -788,7 +801,7 @@ class Handler(BaseHTTPRequestHandler):
             self._forward_native(method, body, native_route, _model, _t0, body_json=body_json)
             return
 
-        circuit_provider = _model or "litellm"
+        circuit_provider = (_circuit_key if translate_response and _circuit_key else _model) or "litellm"
         if _circuit.is_open(circuit_provider):
             log.warning("Circuit breaker open for %s, rejecting request", circuit_provider)
             _inc_counter("circuit_breaker_rejected")
@@ -829,26 +842,34 @@ class Handler(BaseHTTPRequestHandler):
             _t1 = time.time()
             _xlate = " [translated]" if translate_response else ""
             log.info("%s %s model=%s status=%d %.1fs%s",
-                     method, self.path, _model or "-", resp.status, _t1 - _t0, _xlate)
+                     method, self.path, _model or _circuit_key or "-", resp.status, _t1 - _t0, _xlate)
 
             if resp.status < 500:
                 _circuit.record_success(circuit_provider)
             else:
                 _circuit.record_failure(circuit_provider)
 
-            if _is_streaming(resp):
-                self._stream_response(resp, conn, translate_response)
-            elif resp.getheader("Content-Length") is None:
-                self._stream_response(resp, conn, translate_response)
-            else:
-                try:
-                    upstream_cl = int(resp.getheader("Content-Length"))
-                except (TypeError, ValueError):
-                    upstream_cl = 0
-                if upstream_cl > MAX_RESPONSE_BODY:
+            if translate_response:
+                # Translated path: only stream if actually SSE
+                if _is_streaming(resp):
                     self._stream_response(resp, conn, translate_response)
                 else:
                     self._buffer_response(resp, conn, translate_response)
+            else:
+                # Pass-through path: stream on SSE or chunked/no-CL
+                if _is_streaming(resp) or _is_chunked(resp):
+                    self._stream_response(resp, conn, translate_response)
+                elif resp.getheader("Content-Length") is None:
+                    self._stream_response(resp, conn, translate_response)
+                else:
+                    try:
+                        upstream_cl = int(resp.getheader("Content-Length"))
+                    except (TypeError, ValueError):
+                        upstream_cl = 0
+                    if upstream_cl > MAX_RESPONSE_BODY:
+                        self._stream_response(resp, conn, translate_response)
+                    else:
+                        self._buffer_response(resp, conn, translate_response)
         except (socket.timeout, ConnectionRefusedError, http.client.HTTPException, OSError) as e:
             self._handle_upstream_error(e, method, self.path, circuit_provider=circuit_provider)
         finally:
@@ -867,7 +888,51 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_error(502, "Upstream response too large", "upstream_error")
                 return
         if translate and resp.status == 200:
+            # Validate upstream response before translation
+            ct = resp.getheader("Content-Type", "")
+            if "application/json" not in ct.lower():
+                log.warning("Translated upstream returned non-JSON Content-Type: %s", ct)
+                self._send_error(502, "Provider returned unexpected content type", "upstream_error")
+                return
+            try:
+                upstream_data = json.loads(bytes(buf))
+            except (ValueError, TypeError):
+                log.warning("Translated upstream returned invalid JSON")
+                self._send_error(502, "Provider returned invalid JSON", "upstream_error")
+                return
+            if isinstance(upstream_data, dict) and "error" in upstream_data:
+                err = upstream_data["error"]
+                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                log.warning("Translated upstream 200 with error body: %s", err_msg[:200])
+                self._send_error(502, "Provider returned error", "upstream_error")
+                return
+            choices = upstream_data.get("choices", [])
+            if not choices:
+                log.warning("Translated upstream 200 with empty choices")
+                self._send_error(502, "Provider returned empty response", "upstream_error")
+                return
             buf = _openai_to_anthropic(bytes(buf))
+        elif translate:
+            # Non-200 translated response — normalize to Anthropic error envelope
+            log.warning("Translated upstream returned %d", resp.status)
+            if resp.status == 429:
+                code, body = _error_response(429, "Provider rate limited", "upstream_error")
+            elif resp.status >= 500:
+                code, body = _error_response(502, "Provider temporarily unavailable", "upstream_error")
+            elif resp.status in (401, 403):
+                code, body = _error_response(502, "Provider authentication failed", "auth_error")
+            else:
+                code, body = _error_response(502, "Provider request failed", "upstream_error")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if resp.status == 429:
+                retry_after = resp.getheader("Retry-After")
+                if retry_after:
+                    self.send_header("Retry-After", retry_after)
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(resp.status)
         for k, v in resp.getheaders():
             if k.lower() not in ("transfer-encoding", "connection", "keep-alive", "content-length"):
@@ -966,13 +1031,13 @@ class Handler(BaseHTTPRequestHandler):
 
             # Validate Content-Type on non-streaming success responses
             ct = resp.getheader("Content-Type", "")
-            if resp.status == 200 and not _is_streaming(resp):
+            if resp.status == 200 and not _is_streaming(resp) and not _is_chunked(resp):
                 if "application/json" not in ct.lower() and "text/event-stream" not in ct.lower():
                     log.warning("Native upstream returned unexpected Content-Type: %s for %s", ct, forward_path)
                     self._send_error(502, "Provider returned unexpected content type", "upstream_error")
                     return
 
-            if _is_streaming(resp):
+            if _is_streaming(resp) or _is_chunked(resp):
                 self._stream_response(resp, conn, translate=False)
             elif resp.getheader("Content-Length") is None:
                 self._stream_response(resp, conn, translate=False)
@@ -1130,6 +1195,7 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 if time.monotonic() - start_time > MAX_STREAM_LIFETIME:
                     log.warning("SSE xlate: lifetime exceeded %ds for %s", MAX_STREAM_LIFETIME, self.path)
+                    _send_done_and_close("max_tokens")
                     _log_summary("lifetime_exceeded")
                     break
 
@@ -1143,6 +1209,7 @@ class Handler(BaseHTTPRequestHandler):
                                     chunks_received, total_bytes_read, in_think, output_tokens,
                                     now - last_chunk_time)
                         _inc_counter("xlate_stream_eof_no_finish")
+                        _send_done_and_close("end_turn")
                     _log_summary("eof")
                     break
 
@@ -1151,12 +1218,25 @@ class Handler(BaseHTTPRequestHandler):
                 total_bytes_read += len(data)
                 chunks_received += 1
 
+                if total_bytes_read > MAX_SSE_TOTAL_BYTES:
+                    log.warning("SSE xlate: total bytes exceeded %d, aborting", MAX_SSE_TOTAL_BYTES)
+                    _inc_counter("xlate_stream_errors")
+                    _send_done_and_close("max_tokens")
+                    _log_summary("total_bytes_exceeded")
+                    break
+
                 if idle_gap > 5.0:
                     log.debug("SSE xlate: chunk %d after %.1fs idle (%d bytes)", chunks_received, idle_gap, len(data))
                     # Keep-alive ping to prevent proxy/LB timeout
                     _send_event("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 
                 buf += data
+                if len(buf) > MAX_SSE_LINE_BYTES:
+                    log.warning("SSE xlate: line buffer exceeded %d bytes, aborting", MAX_SSE_LINE_BYTES)
+                    _inc_counter("xlate_stream_errors")
+                    _send_done_and_close("end_turn")
+                    _log_summary("line_buffer_exceeded")
+                    break
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     line_str = line.decode("utf-8", errors="replace").strip()
@@ -1180,17 +1260,7 @@ class Handler(BaseHTTPRequestHandler):
                         log.warning("SSE xlate: mid-stream error from upstream: %s", err_msg)
                         # Emit error as text so Claude Code sees it
                         _process_text("\n[Upstream error: %s]" % err_msg)
-                        # Properly close the Anthropic stream
-                        if text_block_open:
-                            _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n")
-                            content_block_index += 1
-                            text_block_open = False
-                        stop = _map_finish_reason("stop")
-                        evt = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}}
-                        _send_event(f"event: message_delta\ndata: {json.dumps(evt)}\n\n")
-                        _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
-                        finish_reason_seen = "error"
-                        done = True
+                        _send_done_and_close("end_turn")
                         break
 
                     if not msg_id:
@@ -1249,20 +1319,20 @@ class Handler(BaseHTTPRequestHandler):
                             tool_calls[tc_idx]["name"] = fn["name"]
                         if tc.get("id"):
                             tool_calls[tc_idx]["id"] = tc["id"]
+
+                        # Start tool_use block on first appearance (id or name), not on arguments
+                        if tc_idx not in tool_blocks_started and (tc.get("id") or fn.get("name")):
+                            if text_block_open:
+                                _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n")
+                                content_block_index += 1
+                                text_block_open = False
+                            tool_blocks_started.add(tc_idx)
+                            block_idx = content_block_index + tc_idx
+                            _send_event(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'tool_use', 'id': tool_calls[tc_idx]['id'], 'name': tool_calls[tc_idx]['name'], 'input': {}}})}\n\n")
+
+                        # Always accumulate arguments
                         if fn.get("arguments"):
                             tool_calls[tc_idx]["arguments"] += fn["arguments"]
-
-                            # Stream the tool call arguments as input_json_delta
-                            if tc_idx not in tool_blocks_started:
-                                # Close text block if open
-                                if text_block_open:
-                                    _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_block_index})}\n\n")
-                                    content_block_index += 1
-                                    text_block_open = False
-                                tool_blocks_started.add(tc_idx)
-                                block_idx = content_block_index + tc_idx
-                                _send_event(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'tool_use', 'id': tool_calls[tc_idx]['id'], 'name': tool_calls[tc_idx]['name'], 'input': {}}})}\n\n")
-
                             block_idx = content_block_index + tc_idx
                             evt = {"type": "content_block_delta", "index": block_idx, "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}}
                             _send_event(f"event: content_block_delta\ndata: {json.dumps(evt)}\n\n")
@@ -1307,16 +1377,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stream_response(self, resp, conn, translate=False):
         """Forward an SSE / chunked response incrementally with idle timeout."""
-        self.send_response(resp.status)
 
         if translate and resp.status == 200:
+            ct = resp.getheader("Content-Type", "")
+            if "text/event-stream" not in ct.lower():
+                log.warning("Translated streaming response has unexpected Content-Type: %s", ct)
+                # Fall through to buffer and validate
+                self._buffer_response(resp, conn, translate)
+                return
             # Send Anthropic-style SSE headers instead of forwarding upstream headers
+            self.send_response(resp.status)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             self._stream_translated(resp, conn)
             return
 
+        self.send_response(resp.status)
         for k, v in resp.getheaders():
             if k.lower() not in ("transfer-encoding", "connection", "keep-alive", "content-length"):
                 self.send_header(k, v)
