@@ -1,5 +1,8 @@
+import logging
 from abc import ABC, abstractmethod
 from enum import Enum
+
+log = logging.getLogger("litellm-cli.providers")
 
 THINKING_LEVELS = ("low", "medium", "high")
 
@@ -118,26 +121,33 @@ class BaseProvider(ABC):
         Returns (Status, message_string) — caller returns directly.
         """
         if resp.status_code in (401, 403):
+            log.warning("%s validation: HTTP %d (invalid credentials)", self.name, resp.status_code)
             return Status.INVALID, f"Invalid or forbidden credentials (HTTP {resp.status_code})"
         if resp.status_code == 429:
+            log.warning("%s validation: rate limited (HTTP 429)", self.name)
             return Status.UNREACHABLE, "Rate limited — credential not verified"
         if resp.status_code >= 500:
+            log.warning("%s validation: server error (HTTP %d)", self.name, resp.status_code)
             return Status.UNREACHABLE, f"Provider server error (HTTP {resp.status_code}) — key not validated"
         if resp.status_code != 200:
+            log.warning("%s validation: unexpected status %d", self.name, resp.status_code)
             return Status.UNREACHABLE, f"Unexpected status {resp.status_code}"
 
         ct = resp.headers.get("Content-Type", "")
         if "application/json" not in ct:
+            log.warning("%s validation: unexpected Content-Type %s", self.name, ct)
             return Status.UNREACHABLE, f"Unexpected Content-Type: {ct}"
 
         try:
             data = resp.json()
         except ValueError:
+            log.warning("%s validation: non-JSON response body", self.name)
             return Status.UNREACHABLE, "Non-JSON response"
 
         if isinstance(data, dict) and "error" in data:
             err = data["error"]
             msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            log.warning("%s validation: error envelope in 200 response: %s", self.name, msg)
             return Status.INVALID, f"Provider error: {msg}"
 
         return Status.OK, ""

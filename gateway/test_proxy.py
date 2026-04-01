@@ -1,6 +1,7 @@
 import sys
 import unittest
 import types
+import json
 
 sys.argv = [sys.argv[0]]
 
@@ -9,7 +10,10 @@ yaml_stub = types.ModuleType("yaml")
 yaml_stub.safe_load = lambda *a, **k: {}
 sys.modules["yaml"] = yaml_stub
 
-import proxy
+try:
+    from gateway import proxy
+except ImportError:
+    import proxy
 
 
 class ProxyErrorMappingTests(unittest.TestCase):
@@ -74,7 +78,10 @@ class ProxyValidationTests(unittest.TestCase):
 class ProxyThinkingContractTests(unittest.TestCase):
     def test_build_route_state_handles_empty_entries(self):
         """_build_route_state must not fail on empty input."""
-        import providers as p_module
+        try:
+            from gateway import providers as p_module
+        except ImportError:
+            import providers as p_module
         orig_all = p_module.all_providers
         p_module.all_providers = lambda: []
         try:
@@ -111,6 +118,44 @@ class ProxyThinkingContractTests(unittest.TestCase):
         self.assertEqual(proxy._UPSTREAM_ERROR_STOP, "upstream_error")
         # Must be distinct from normal finish reasons
         self.assertNotEqual(proxy._UPSTREAM_ERROR_STOP, proxy._map_finish_reason("stop"))
+
+
+class ProxyTranslationEngineTests(unittest.TestCase):
+    def test_normalize_translation_engine_defaults_to_v2(self):
+        self.assertEqual("v2", proxy._normalize_translation_engine(None))
+        self.assertEqual("v2", proxy._normalize_translation_engine("bogus"))
+
+    def test_normalize_translation_engine_accepts_v1_and_v2(self):
+        self.assertEqual("v1", proxy._normalize_translation_engine("v1"))
+        self.assertEqual("v2", proxy._normalize_translation_engine("v2"))
+
+
+class ProxyLegacyTranslationTests(unittest.TestCase):
+    def test_anthropic_to_openai_forced_tool_choice_filters_tools_and_uses_required(self):
+        translated = json.loads(
+            proxy._anthropic_to_openai(
+                {
+                    "model": "demo-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "tools": [
+                        {
+                            "name": "echo_tool",
+                            "description": "Echo text",
+                            "input_schema": {"type": "object"},
+                        },
+                        {
+                            "name": "other_tool",
+                            "description": "Other text",
+                            "input_schema": {"type": "object"},
+                        },
+                    ],
+                    "tool_choice": {"type": "tool", "name": "echo_tool"},
+                }
+            ).decode("utf-8")
+        )
+        self.assertEqual("required", translated["tool_choice"])
+        self.assertEqual(1, len(translated["tools"]))
+        self.assertEqual("echo_tool", translated["tools"][0]["function"]["name"])
 
 
 if __name__ == "__main__":

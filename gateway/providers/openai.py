@@ -5,8 +5,12 @@ from datetime import datetime, timezone
 
 import requests
 
-import config
-from providers.base import BaseProvider, Status
+try:
+    from .. import config
+    from .base import BaseProvider, Status
+except ImportError:
+    import config
+    from providers.base import BaseProvider, Status
 
 log = logging.getLogger("litellm-cli.openai")
 
@@ -92,10 +96,12 @@ class OpenAIProvider(BaseProvider):
             )
         except requests.RequestException as e:
             return Status.UNREACHABLE, f"Cannot reach OpenAI API: {e}"
-        status, _ = self._classify_response(resp)
+        status, msg = self._classify_response(resp)
         if status == Status.OK:
             return status, "Authenticated with OpenAI API key"
-        return status, _
+        if status == Status.INVALID and resp.status_code == 403:
+            return status, "OPENAI_API_KEY lacks required permissions (403 Forbidden)"
+        return status, msg
 
     def _validate_browser(self):
         """Check browser OAuth auth without making billing API calls.
@@ -253,7 +259,7 @@ class OpenAIProvider(BaseProvider):
                           "max_tokens": 1},
                     timeout=5,
                 )
-            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+            except requests.RequestException as e:
                 log.debug("OAuth trigger request failed (expected): %s", e)
 
         print("\n  Waiting for login instructions from container...")

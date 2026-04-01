@@ -1,7 +1,11 @@
 import logging
 import requests
-import config
-from providers.base import BaseProvider, Status, is_placeholder
+try:
+    from .. import config
+    from .base import BaseProvider, Status, is_placeholder
+except ImportError:
+    import config
+    from providers.base import BaseProvider, Status, is_placeholder
 
 log = logging.getLogger("litellm-cli.minimax")
 
@@ -56,12 +60,12 @@ class MiniMaxProvider(BaseProvider):
         except requests.RequestException as e:
             return Status.UNREACHABLE, f"Cannot reach MiniMax API: {e}"
 
-        status, _ = self._classify_response(resp)
+        status, msg = self._classify_response(resp)
         if status == Status.OK:
             return status, "Authenticated with MiniMax"
-        if status == Status.INVALID:
-            return status, f"Invalid MINIMAX_API_KEY"
-        return status, _
+        if status == Status.INVALID and resp.status_code in (401, 403):
+            return status, "Invalid MINIMAX_API_KEY"
+        return status, msg
 
     login_prompts = {
         "api_key": {

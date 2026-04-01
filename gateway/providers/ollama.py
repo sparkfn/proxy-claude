@@ -5,7 +5,10 @@ import shutil
 import subprocess
 from urllib.parse import urlparse
 import requests
-from providers.base import BaseProvider, Status
+try:
+    from .base import BaseProvider, Status
+except ImportError:
+    from providers.base import BaseProvider, Status
 
 log = logging.getLogger("litellm-cli.ollama")
 

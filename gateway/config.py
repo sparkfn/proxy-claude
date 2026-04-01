@@ -6,7 +6,10 @@ import stat
 import tempfile
 import yaml
 
-from providers.base import Status
+try:
+    from .providers.base import Status
+except ImportError:
+    from providers.base import Status
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("litellm-cli.config")

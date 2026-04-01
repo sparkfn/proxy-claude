@@ -2,8 +2,12 @@ import logging
 
 import requests
 
-import config
-from providers.base import BaseProvider, Status, is_placeholder
+try:
+    from .. import config
+    from .base import BaseProvider, Status, is_placeholder
+except ImportError:
+    import config
+    from providers.base import BaseProvider, Status, is_placeholder
 
 log = logging.getLogger("litellm-cli.zhipu")
 

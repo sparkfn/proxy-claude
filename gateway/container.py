@@ -8,7 +8,10 @@ import os
 
 import requests
 
-from providers.base import Status
+try:
+    from .providers.base import Status
+except ImportError:
+    from providers.base import Status
 
 log = logging.getLogger("litellm-cli.container")
 

@@ -18,12 +18,61 @@ import http.client
 import socket
 import ssl
 import threading
-import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import logging
+try:
+    from gateway.proxy_v2.contracts import (
+        UPSTREAM_ERROR_STOP as _UPSTREAM_ERROR_STOP,
+        map_openai_finish_reason as _map_finish_reason,
+        resolve_legacy_terminal_stop_reason as _resolve_legacy_terminal_stop_reason,
+    )
+    from gateway.proxy_v2.errors import (
+        ProxyError as _V2ProxyError,
+        error_response as _error_response,
+        map_upstream_status as _map_upstream_status,
+    )
+    from gateway.proxy_v2.routes import (
+        build_route_state as _build_route_state,
+        resolve_config_path as _resolve_config_path,
+    )
+    from gateway.proxy_v2.runtime import (
+        translate_buffered_response as _translate_buffered_response_v2,
+        translate_stream as _translate_stream_v2,
+    )
+    from gateway.proxy_v2.request_translate import (
+        apply_openai_tools_and_choice as _apply_openai_tools_and_choice_v2,
+    )
+    from gateway.proxy_v2.translate import (
+        anthropic_to_openai_request as _anthropic_to_openai_v2,
+    )
+except ImportError:
+    from proxy_v2.contracts import (
+        UPSTREAM_ERROR_STOP as _UPSTREAM_ERROR_STOP,
+        map_openai_finish_reason as _map_finish_reason,
+        resolve_legacy_terminal_stop_reason as _resolve_legacy_terminal_stop_reason,
+    )
+    from proxy_v2.errors import (
+        ProxyError as _V2ProxyError,
+        error_response as _error_response,
+        map_upstream_status as _map_upstream_status,
+    )
+    from proxy_v2.routes import (
+        build_route_state as _build_route_state,
+        resolve_config_path as _resolve_config_path,
+    )
+    from proxy_v2.runtime import (
+        translate_buffered_response as _translate_buffered_response_v2,
+        translate_stream as _translate_stream_v2,
+    )
+    from proxy_v2.request_translate import (
+        apply_openai_tools_and_choice as _apply_openai_tools_and_choice_v2,
+    )
+    from proxy_v2.translate import (
+        anthropic_to_openai_request as _anthropic_to_openai_v2,
+    )
 
 log = logging.getLogger("litellm-proxy")
 
@@ -75,6 +124,19 @@ MAX_STREAM_BYTES = _parse_size(os.environ.get("PROXY_MAX_STREAM_BYTES"), 250 * 1
 MAX_SSE_LINE_BYTES = _parse_size(os.environ.get("PROXY_MAX_SSE_LINE_BYTES"), 10 * 1024**2)  # 10MB per SSE line
 MAX_SSE_TOTAL_BYTES = _parse_size(os.environ.get("PROXY_MAX_SSE_TOTAL_BYTES"), 250 * 1024**2)  # 250MB total translated stream
 SOCKET_TIMEOUT = _env_int("PROXY_SOCKET_TIMEOUT", 30)
+
+
+def _normalize_translation_engine(value):
+    engine = (value or "v2").strip().lower()
+    if engine not in ("v1", "v2"):
+        log.warning("Invalid PROXY_TRANSLATION_ENGINE='%s', using v2", value)
+        return "v2"
+    return engine
+
+
+TRANSLATION_ENGINE = _normalize_translation_engine(
+    os.environ.get("PROXY_TRANSLATION_ENGINE", "v2")
+)
 
 
 _COUNTERS = {
@@ -157,31 +219,6 @@ class _CircuitBreaker:
 
 
 _circuit = _CircuitBreaker()
-
-
-def _error_response(status_code, message, error_type="proxy_error"):
-    """Build a JSON error body and return (status_code, body_bytes)."""
-    return status_code, json.dumps(
-        {"error": {"message": message, "type": error_type}}
-    ).encode()
-
-
-def _map_upstream_status(status_code):
-    """Map an upstream HTTP status to the canonical proxy (code, message, type) tuple.
-
-    All upstream errors — whether from a translated or native route — flow through
-    this one mapping so error envelopes are consistent. Callers send the response
-    via the standard _try_send_error path.
-    """
-    if status_code in (401, 403):
-        return 502, "Provider authentication failed", "auth_error"
-    if status_code == 429:
-        return 429, "Provider rate limited — retry later", "upstream_error"
-    if status_code >= 500:
-        return 502, "Provider temporarily unavailable", "upstream_error"
-    return 502, "Provider request failed", "upstream_error"
-
-
 def _backend_readiness():
     """Probe LiteLLM readiness from inside the gateway process."""
     url = f"http://{LITELLM_HOST}:{LITELLM_PORT}/health/readiness"
@@ -270,66 +307,6 @@ _ALL_CONFIGURED_MODELS = None
 _NATIVE_ANTHROPIC_MODELS = None
 # Cache: model_name -> verified thinking contract
 _THINKING_CONTRACTS = None
-
-
-def _build_route_state(entries):
-    """Build cached routing and thinking state from config model entries."""
-    translated = set()
-    all_models = []
-    native = {}
-    thinking_contracts = {}
-
-    provider_for_model = {}
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import providers
-    for p in providers.all_providers():
-        if p.anthropic_base_url:
-            for model_name in p.models:
-                provider_for_model[model_name] = p
-
-    import config as cfg
-
-    for entry in entries:
-        name = entry.get("model_name", "")
-        if not name:
-            continue
-
-        all_models.append(name)
-        litellm_params = dict(entry.get("litellm_params", {}) or {})
-        litellm_model = litellm_params.get("model", "")
-        provider_name = cfg._provider_from_model(litellm_model, litellm_params)
-        model_entry = {
-            "alias": name,
-            "model": litellm_model,
-            "provider": provider_name,
-            "litellm_params": litellm_params,
-        }
-        thinking_contract = cfg.resolve_thinking_contract(model_entry)
-        if thinking_contract:
-            thinking_contracts[name] = thinking_contract
-            if thinking_contract.get("requires_openai_translation"):
-                translated.add(name)
-
-        if name in provider_for_model:
-            p = provider_for_model[name]
-            if not p.native_auth:
-                log.warning("Provider %s has anthropic_base_url but no native_auth — skipping native route", p.name)
-                continue
-            api_key_env = p.native_auth.get("env")
-            auth_header = p.native_auth.get("header", "x-api-key")
-            parsed = urllib.parse.urlparse(p.anthropic_base_url)
-            native[name] = {"host": parsed.hostname, "port": parsed.port or 443,
-                            "path": parsed.path.rstrip("/"), "api_key_env": api_key_env,
-                            "auth_header": auth_header}
-            log.info("Native Anthropic route: %s → %s", name, p.anthropic_base_url)
-
-    return {
-        "translated": translated,
-        "all_models": all_models,
-        "native": native,
-        "thinking_contracts": thinking_contracts,
-    }
-
 def _load_translated_models():
     """Load model routing tables from config + provider registry.
 
@@ -341,8 +318,9 @@ def _load_translated_models():
     global _OPENAI_TRANSLATED_MODELS, _ALL_CONFIGURED_MODELS, _NATIVE_ANTHROPIC_MODELS, _THINKING_CONTRACTS
 
     import yaml
-    # Config lives at repo root, one level above this module
-    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "litellm_config.yaml")
+    # Config lives at repo root (one level above this module) on host,
+    # but is mounted alongside proxy.py in the container at /app/.
+    config_path = _resolve_config_path(os.path.dirname(os.path.abspath(__file__)))
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     route_state = _build_route_state(cfg.get("model_list", []))
@@ -567,38 +545,14 @@ def _anthropic_to_openai(body_json, thinking_effort=None, thinking_contract=None
     # Inject thinking/reasoning effort if set and verified
     _apply_verified_thinking_contract(openai_body, thinking_contract, thinking_effort)
 
-    # Convert Anthropic tools → OpenAI tools
-    tools = data.get("tools")
-    if tools:
-        openai_tools = []
-        for tool in tools:
-            if tool.get("cache_control"):
-                log.debug("Tool cache_control present but not forwarded (OpenAI-compatible endpoint)")
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool.get("name", ""),
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("input_schema", {}),
-                },
-            })
-        openai_body["tools"] = openai_tools
-
-    # Map Anthropic tool_choice → OpenAI tool_choice
-    tc = data.get("tool_choice")
-    if tc and openai_body.get("tools"):
-        tc_type = tc.get("type", "auto") if isinstance(tc, dict) else tc
-        if tc_type == "auto":
-            openai_body["tool_choice"] = "auto"
-        elif tc_type == "any":
-            openai_body["tool_choice"] = "required"
-        elif tc_type == "none":
-            openai_body["tool_choice"] = "none"
-        elif tc_type == "tool":
-            openai_body["tool_choice"] = {
-                "type": "function",
-                "function": {"name": tc.get("name", "")},
-            }
+    try:
+        _apply_openai_tools_and_choice_v2(
+            openai_body,
+            tools=data.get("tools"),
+            tool_choice=data.get("tool_choice"),
+        )
+    except _V2ProxyError as exc:
+        raise ValueError(exc.message) from exc
 
     response_format = data.get("response_format")
     if response_format:
@@ -691,30 +645,6 @@ def _strip_think_tags(text):
     # Remove <think>...</think> blocks (including multiline)
     cleaned = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
     return cleaned.strip()
-
-
-def _map_finish_reason(finish_reason):
-    """Map OpenAI finish_reason to Anthropic stop_reason."""
-    if finish_reason == "stop":
-        return "end_turn"
-    if finish_reason in ("tool_calls", "function_call"):
-        return "tool_use"
-    if finish_reason == "length":
-        return "max_tokens"
-    if finish_reason == "content_filter":
-        log.warning("Upstream content_filter triggered — response may be truncated")
-        return "end_turn"
-    if finish_reason:
-        log.debug("Unknown finish_reason %s mapped to end_turn", finish_reason)
-    return "end_turn"
-
-
-# Sentinel stop reason for mid-stream upstream errors in translated SSE.
-# Distinct from "end_turn" so clients can distinguish stream errors from
-# normal completion without parsing message content.
-_UPSTREAM_ERROR_STOP = "upstream_error"
-
-
 def _is_streaming(resp):
     """Return True if the upstream response is an SSE stream."""
     ct = resp.getheader("Content-Type", "").lower()
@@ -847,15 +777,27 @@ class Handler(BaseHTTPRequestHandler):
                 # Capture model name for circuit breaker before translation clears body_json
                 _circuit_key = body_json.get("model", "") if isinstance(body_json, dict) else ""
                 # Rewrite Anthropic request to OpenAI format for verified OpenAI-compatible routes
-                body = _anthropic_to_openai(
-                    body_json,
-                    thinking_effort=thinking,
-                    thinking_contract=thinking_contract,
-                )
+                if TRANSLATION_ENGINE == "v2":
+                    body = _anthropic_to_openai_v2(
+                        body_json,
+                        thinking_effort=thinking,
+                        thinking_contract=thinking_contract,
+                    )
+                else:
+                    body = _anthropic_to_openai(
+                        body_json,
+                        thinking_effort=thinking,
+                        thinking_contract=thinking_contract,
+                    )
                 body_json = None
                 self.path = "/v1/chat/completions"
                 translate_response = True
-                log.debug("Translated Anthropic→OpenAI for %s (thinking=%s)", self.path, thinking or "default")
+                log.info(
+                    "Translated Anthropic→OpenAI for %s via %s (thinking=%s)",
+                    self.path,
+                    TRANSLATION_ENGINE,
+                    thinking or "default",
+                )
             else:
                 body_json = strip_system(body_json)
                 body = json.dumps(body_json).encode()
@@ -981,7 +923,19 @@ class Handler(BaseHTTPRequestHandler):
                 log.warning("Translated upstream 200 with empty choices")
                 self._send_error(502, "Provider returned empty response", "upstream_error")
                 return
-            buf = _openai_to_anthropic(bytes(buf))
+            try:
+                if TRANSLATION_ENGINE == "v2":
+                    buf = _translate_buffered_response_v2(bytes(buf))
+                else:
+                    buf = _openai_to_anthropic(bytes(buf))
+            except _V2ProxyError as e:
+                log.warning("V2 buffered translation failed: %s", e.message)
+                self._send_error(502, "Provider returned invalid translated response", "upstream_error")
+                return
+            except ValueError as e:
+                log.warning("V1 buffered translation failed: %s", e)
+                self._send_error(502, "Provider returned invalid translated response", "upstream_error")
+                return
         elif translate:
             # Non-200 translated response — normalize via canonical mapper
             log.warning("Translated upstream returned %d", resp.status)
@@ -1151,7 +1105,7 @@ class Handler(BaseHTTPRequestHandler):
                     block_idx = content_block_index + tc_idx
                     _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n")
                 tool_blocks_started.clear()
-            stop = _map_finish_reason(reason)
+            stop = _resolve_legacy_terminal_stop_reason(reason)
             evt = {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}}
             _send_event(f"event: message_delta\ndata: {json.dumps(evt)}\n\n")
             _send_event("event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
@@ -1315,11 +1269,8 @@ class Handler(BaseHTTPRequestHandler):
                                 },
                             }
                             _send_event(f"event: message_start\ndata: {json.dumps(evt)}\n\n")
-                        # Emit error as a visible text block, not injected assistant text
-                        err_index = content_block_index
-                        content_block_index += 1
-                        _send_event(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': err_index, 'content_block': {'type': 'text', 'text': '[Upstream error: %s]' % err_msg}})}\n\n")
-                        _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': err_index})}\n\n")
+                        # Emit error as a visible text block via the standard delta path
+                        _send_text_delta("\n[Upstream error: %s]" % err_msg)
                         _send_done_and_close(_UPSTREAM_ERROR_STOP)
                         break
 
@@ -1435,6 +1386,73 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def _stream_translated_v2(self, resp, conn):
+        """Translate OpenAI SSE stream via the V2 event/runtime pipeline."""
+        try:
+            resp.fp.raw._sock.settimeout(STREAM_IDLE_TIMEOUT)
+            log.debug("SSE xlate v2: idle timeout set to %ds", STREAM_IDLE_TIMEOUT)
+        except (AttributeError, TypeError) as e:
+            log.warning("SSE xlate v2: could not set idle timeout: %s", e)
+
+        start_time = time.monotonic()
+        total_streamed = 0
+
+        def _abort_signal():
+            return not _ALIVE
+
+        def _upstream_chunks():
+            nonlocal total_streamed
+            while True:
+                if time.monotonic() - start_time > MAX_STREAM_LIFETIME:
+                    raise _V2ProxyError(
+                        502,
+                        "Translated stream lifetime exceeded",
+                        "upstream_error",
+                        code="stream_lifetime_exceeded",
+                    )
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+                total_streamed += len(chunk)
+                if total_streamed > MAX_SSE_TOTAL_BYTES:
+                    raise _V2ProxyError(
+                        502,
+                        "Translated stream exceeded byte budget",
+                        "upstream_error",
+                        code="stream_total_bytes_exceeded",
+                    )
+                yield chunk
+
+        try:
+            for payload in _translate_stream_v2(
+                _upstream_chunks(),
+                abort_signal=_abort_signal,
+                logger=log,
+            ):
+                self.wfile.write(f"{len(payload):x}\r\n".encode())
+                self.wfile.write(payload)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+            log.info(
+                "SSE xlate v2 done: bytes_read=%d elapsed=%.1fs path=%s",
+                total_streamed,
+                time.monotonic() - start_time,
+                self.path,
+            )
+        except (socket.timeout, BrokenPipeError, ConnectionResetError, OSError) as e:
+            log.warning("SSE xlate v2: stream error: %s [%s]", type(e).__name__, e)
+            _inc_counter("xlate_stream_errors")
+        finally:
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+
     def _stream_response(self, resp, conn, translate=False):
         """Forward an SSE / chunked response incrementally with idle timeout."""
 
@@ -1450,7 +1468,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            self._stream_translated(resp, conn)
+            if TRANSLATION_ENGINE == "v2":
+                self._stream_translated_v2(resp, conn)
+            else:
+                self._stream_translated(resp, conn)
             return
 
         self.send_response(resp.status)
