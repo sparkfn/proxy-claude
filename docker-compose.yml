@@ -33,6 +33,7 @@ services:
     environment:
       - PROXY_LITELLM_HOST=litellm
       - PROXY_LITELLM_PORT=4000
+      - PROXY_MAX_WORKERS=64
     depends_on:
       litellm:
         condition: service_healthy
