@@ -54,19 +54,18 @@ class OllamaProvider(BaseProvider):
         host = self.OLLAMA_HOST
         try:
             resp = requests.get(f"{host}/api/tags", timeout=3)
-            if resp.status_code != 200:
-                return Status.UNREACHABLE, f"Ollama returned status {resp.status_code}"
-            ct = resp.headers.get("Content-Type", "")
-            if "json" not in ct:
-                return Status.UNREACHABLE, f"Ollama returned unexpected Content-Type: {ct}"
-            try:
-                resp.json()
-            except ValueError:
-                return Status.UNREACHABLE, "Ollama returned invalid JSON"
-            return Status.OK, f"Ollama is reachable at {host}"
         except requests.RequestException as e:
-            log.warning("Ollama validate failed: %s", e)
             return Status.UNREACHABLE, f"Cannot reach Ollama at {host}: {e}"
+        if resp.status_code != 200:
+            return Status.UNREACHABLE, f"Ollama returned status {resp.status_code}"
+        ct = resp.headers.get("Content-Type", "")
+        if "json" not in ct:
+            return Status.UNREACHABLE, f"Ollama returned unexpected Content-Type: {ct}"
+        try:
+            resp.json()
+        except ValueError:
+            return Status.UNREACHABLE, "Ollama returned invalid JSON"
+        return Status.OK, f"Ollama is reachable at {host}"
 
     def login(self, auth_type=None, credentials=None):
         """Validate Ollama connectivity. Returns (Status, msg).

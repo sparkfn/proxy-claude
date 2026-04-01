@@ -90,26 +90,12 @@ class OpenAIProvider(BaseProvider):
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=10,
             )
-            if resp.status_code == 401:
-                return Status.INVALID, "Invalid OPENAI_API_KEY"
-            if resp.status_code == 403:
-                return Status.INVALID, "OPENAI_API_KEY lacks required permissions (403 Forbidden)"
-            if resp.status_code == 429:
-                return Status.UNREACHABLE, "Rate limited (HTTP 429) — credential not verified"
-            if resp.status_code >= 500:
-                return Status.UNREACHABLE, f"OpenAI server error (HTTP {resp.status_code}) — key not validated"
-            if resp.status_code != 200:
-                return Status.UNREACHABLE, f"OpenAI returned unexpected status {resp.status_code} — key not validated"
-            ct = resp.headers.get("Content-Type", "")
-            if "application/json" not in ct:
-                return Status.UNREACHABLE, f"OpenAI returned unexpected content-type: {ct}"
-            try:
-                resp.json()
-            except ValueError:
-                return Status.UNREACHABLE, "OpenAI returned invalid JSON"
-            return Status.OK, "Authenticated with OpenAI API key"
         except requests.RequestException as e:
             return Status.UNREACHABLE, f"Cannot reach OpenAI API: {e}"
+        status, _ = self._classify_response(resp)
+        if status == Status.OK:
+            return status, "Authenticated with OpenAI API key"
+        return status, _
 
     def _validate_browser(self):
         """Check browser OAuth auth without making billing API calls.
@@ -267,8 +253,8 @@ class OpenAIProvider(BaseProvider):
                           "max_tokens": 1},
                     timeout=5,
                 )
-            except requests.RequestException:
-                pass  # Expected to fail — we just need it to trigger the auth URL in logs
+            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+                log.debug("OAuth trigger request failed (expected): %s", e)
 
         print("\n  Waiting for login instructions from container...")
         login_url = None

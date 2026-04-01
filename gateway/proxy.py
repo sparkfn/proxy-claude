@@ -166,6 +166,22 @@ def _error_response(status_code, message, error_type="proxy_error"):
     ).encode()
 
 
+def _map_upstream_status(status_code):
+    """Map an upstream HTTP status to the canonical proxy (code, message, type) tuple.
+
+    All upstream errors — whether from a translated or native route — flow through
+    this one mapping so error envelopes are consistent. Callers send the response
+    via the standard _try_send_error path.
+    """
+    if status_code in (401, 403):
+        return 502, "Provider authentication failed", "auth_error"
+    if status_code == 429:
+        return 429, "Provider rate limited — retry later", "upstream_error"
+    if status_code >= 500:
+        return 502, "Provider temporarily unavailable", "upstream_error"
+    return 502, "Provider request failed", "upstream_error"
+
+
 def _backend_readiness():
     """Probe LiteLLM readiness from inside the gateway process."""
     url = f"http://{LITELLM_HOST}:{LITELLM_PORT}/health/readiness"
@@ -264,15 +280,12 @@ def _build_route_state(entries):
     thinking_contracts = {}
 
     provider_for_model = {}
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import providers
-        for p in providers.all_providers():
-            if p.anthropic_base_url:
-                for model_name in p.models:
-                    provider_for_model[model_name] = p
-    except Exception as e:
-        log.warning("Could not load providers for native routing: %s", e)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import providers
+    for p in providers.all_providers():
+        if p.anthropic_base_url:
+            for model_name in p.models:
+                provider_for_model[model_name] = p
 
     import config as cfg
 
@@ -327,20 +340,12 @@ def _load_translated_models():
     Called once at startup, cached for all subsequent requests."""
     global _OPENAI_TRANSLATED_MODELS, _ALL_CONFIGURED_MODELS, _NATIVE_ANTHROPIC_MODELS, _THINKING_CONTRACTS
 
-    try:
-        import yaml
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "litellm_config.yaml")
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f)
-        route_state = _build_route_state(cfg.get("model_list", []))
-    except Exception as e:
-        log.warning("Failed to load litellm_config.yaml: %s — model routing disabled", e)
-        route_state = {
-            "translated": set(),
-            "all_models": [],
-            "native": {},
-            "thinking_contracts": {},
-        }
+    import yaml
+    # Config lives at repo root, one level above this module
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "litellm_config.yaml")
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    route_state = _build_route_state(cfg.get("model_list", []))
     _OPENAI_TRANSLATED_MODELS = route_state["translated"]
     _ALL_CONFIGURED_MODELS = route_state["all_models"]
     _NATIVE_ANTHROPIC_MODELS = route_state["native"]
@@ -351,26 +356,6 @@ def _load_translated_models():
     log.debug("Thinking contracts: %s", sorted(_THINKING_CONTRACTS.keys()))
 
 
-def _remap_model_if_needed(body_json):
-    """If the request targets a model that isn't configured, remap to a configured one.
-
-    Claude Code sends background requests (title gen, summarization) to models like
-    claude-haiku-4-5-20251001 which may not be configured. We remap these to the
-    first configured model so they don't 400.
-    """
-    if not _ALL_CONFIGURED_MODELS:
-        return body_json
-    if not isinstance(body_json, dict):
-        return body_json
-    data = body_json
-    model = data.get("model", "")
-    if model and model not in _ALL_CONFIGURED_MODELS:
-        # Pick first configured model as fallback (deterministic, config file order)
-        fallback = _ALL_CONFIGURED_MODELS[0]
-        log.info("Remapping unconfigured model %s → %s", model, fallback)
-        data["model"] = fallback
-        return data
-    return body_json
 
 
 def _get_native_route(body_json):
@@ -724,6 +709,12 @@ def _map_finish_reason(finish_reason):
     return "end_turn"
 
 
+# Sentinel stop reason for mid-stream upstream errors in translated SSE.
+# Distinct from "end_turn" so clients can distinguish stream errors from
+# normal completion without parsing message content.
+_UPSTREAM_ERROR_STOP = "upstream_error"
+
+
 def _is_streaming(resp):
     """Return True if the upstream response is an SSE stream."""
     ct = resp.getheader("Content-Type", "").lower()
@@ -739,18 +730,20 @@ def _is_chunked(resp):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def _send_error(self, status_code, message, error_type="proxy_error"):
+    def _send_error(self, status_code, message, error_type="proxy_error", retry_after=None):
         code, body = _error_response(status_code, message, error_type)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if retry_after is not None:
+            self.send_header("Retry-After", str(retry_after))
         self.end_headers()
         self.wfile.write(body)
 
-    def _try_send_error(self, status_code, message, error_type="proxy_error"):
+    def _try_send_error(self, status_code, message, error_type="proxy_error", retry_after=None):
         """Send error response, logging if client already disconnected."""
         try:
-            self._send_error(status_code, message, error_type)
+            self._send_error(status_code, message, error_type, retry_after=retry_after)
         except (BrokenPipeError, ConnectionResetError, OSError):
             log.debug("Client disconnected before %d response could be sent", status_code)
 
@@ -776,25 +769,6 @@ class Handler(BaseHTTPRequestHandler):
             _circuit.record_failure(circuit_provider)
 
     def _proxy(self, method):
-        if method == "GET" and self.path == "/health":
-            body = b'{"status":"ok"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
-        if method == "GET" and self.path == "/health/readiness":
-            status_code, payload = _backend_readiness()
-            body = json.dumps(payload).encode()
-            self.send_response(status_code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-
         raw_cl = self.headers.get("Content-Length")
         if raw_cl is None:
             if method in ("POST", "PUT", "PATCH"):
@@ -843,9 +817,16 @@ class Handler(BaseHTTPRequestHandler):
                 _inc_counter("invalid_request")
                 self._send_error(400, err, "validation_error")
                 return
-            # Remap unconfigured models to a configured fallback
-            # (Claude Code sends background requests to claude-haiku which isn't configured)
-            body_json = _remap_model_if_needed(body_json)
+            # Reject requests for models that are not in the configured model list.
+            # Unknown models must NOT be silently remapped to a fallback — that mutates
+            # billable behavior and corrupts the boundary contract.
+            if _ALL_CONFIGURED_MODELS:
+                model_name = body_json.get("model", "") if isinstance(body_json, dict) else ""
+                if model_name and model_name not in _ALL_CONFIGURED_MODELS:
+                    log.warning("Unknown model requested: %s (configured: %s)", model_name, _ALL_CONFIGURED_MODELS)
+                    _inc_counter("invalid_request")
+                    self._send_error(400, "Unknown model '%s'" % model_name, "validation_error")
+                    return
             thinking = self.headers.get("x-thinking-effort")
             thinking_contract = None
             if isinstance(body_json, dict):
@@ -1002,25 +983,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             buf = _openai_to_anthropic(bytes(buf))
         elif translate:
-            # Non-200 translated response — normalize to Anthropic error envelope
+            # Non-200 translated response — normalize via canonical mapper
             log.warning("Translated upstream returned %d", resp.status)
-            if resp.status == 429:
-                code, body = _error_response(429, "Provider rate limited", "upstream_error")
-            elif resp.status >= 500:
-                code, body = _error_response(502, "Provider temporarily unavailable", "upstream_error")
-            elif resp.status in (401, 403):
-                code, body = _error_response(502, "Provider authentication failed", "auth_error")
-            else:
-                code, body = _error_response(502, "Provider request failed", "upstream_error")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            if resp.status == 429:
-                retry_after = resp.getheader("Retry-After")
-                if retry_after:
-                    self.send_header("Retry-After", retry_after)
-            self.end_headers()
-            self.wfile.write(body)
+            code, msg, err_type = _map_upstream_status(resp.status)
+            retry_after = resp.getheader("Retry-After") if resp.status == 429 else None
+            self._try_send_error(code, msg, err_type, retry_after=retry_after)
             return
         self.send_response(resp.status)
         for k, v in resp.getheaders():
@@ -1086,33 +1053,13 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     raw_err = resp.read(4096)
                     log.debug("Native upstream %d raw body: %s", resp.status, raw_err.decode("utf-8", errors="replace")[:500])
-                except Exception as e:
-                    log.error("Failed to read native error body: %s", e)
+                except (socket.timeout, http.client.HTTPException, OSError) as e:
+                    log.debug("Could not read native error body: %s", e)
                     raw_err = b""
                 log.warning("Native upstream error %d for %s %s", resp.status, method, forward_path)
-
-                # Map upstream status to appropriate proxy status
-                if resp.status == 401 or resp.status == 403:
-                    err_code, err_body = _error_response(502, "Provider authentication failed", "auth_error")
-                elif resp.status == 429:
-                    err_code, err_body = _error_response(429, "Provider rate limited — retry later", "upstream_error")
-                elif resp.status >= 500:
-                    err_code, err_body = _error_response(502, "Provider temporarily unavailable", "upstream_error")
-                else:
-                    err_code, err_body = _error_response(502, "Provider request failed", "upstream_error")
-
-                try:
-                    self.send_response(err_code)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(err_body)))
-                    if resp.status == 429:
-                        retry_after = resp.getheader("Retry-After")
-                        if retry_after:
-                            self.send_header("Retry-After", retry_after)
-                    self.end_headers()
-                    self.wfile.write(err_body)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    log.debug("Client disconnected before native error response could be sent")
+                err_code, err_msg, err_type = _map_upstream_status(resp.status)
+                retry_after = resp.getheader("Retry-After") if resp.status == 429 else None
+                self._try_send_error(err_code, err_msg, err_type, retry_after=retry_after)
                 return
 
             # Record success for circuit breaker
@@ -1346,17 +1293,15 @@ class Handler(BaseHTTPRequestHandler):
                         log.debug("SSE xlate: unparseable chunk: %s (data=%s)", e, data_str[:200])
                         continue
 
-                    # Check for mid-stream error from upstream
-                    # ACCEPTED DEBT: Anthropic SSE has no mid-stream error event type.
-                    # We inject the error as assistant text + end_turn so Claude Code
-                    # sees what went wrong, rather than hard-closing (blind retries)
-                    # or emitting non-standard events (parse errors). The downstream
-                    # sees HTTP 200 + end_turn, not a failure signal.
+                    # Check for mid-stream error from upstream.
+                    # Emit as a proper text content block with a distinct stop_reason
+                    # so the client can distinguish stream errors from normal completion.
                     if "error" in chunk:
                         err = chunk["error"]
                         err_msg = err.get("message", "Unknown upstream error") if isinstance(err, dict) else str(err)
                         log.warning("SSE xlate: mid-stream error from upstream: %s", err_msg)
-                        # Ensure message_start was emitted (required before any events)
+                        _inc_counter("xlate_stream_errors")
+                        # Ensure message_start was emitted (required before content blocks)
                         if not started:
                             started = True
                             msg_id = msg_id or "msg_error"
@@ -1370,9 +1315,12 @@ class Handler(BaseHTTPRequestHandler):
                                 },
                             }
                             _send_event(f"event: message_start\ndata: {json.dumps(evt)}\n\n")
-                        # Emit error as assistant text so Claude Code sees it
-                        _process_text("\n[Upstream error: %s]" % err_msg)
-                        _send_done_and_close("end_turn")
+                        # Emit error as a visible text block, not injected assistant text
+                        err_index = content_block_index
+                        content_block_index += 1
+                        _send_event(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': err_index, 'content_block': {'type': 'text', 'text': '[Upstream error: %s]' % err_msg}})}\n\n")
+                        _send_event(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': err_index})}\n\n")
+                        _send_done_and_close(_UPSTREAM_ERROR_STOP)
                         break
 
                     if not msg_id:
@@ -1575,10 +1523,19 @@ class Handler(BaseHTTPRequestHandler):
         self._proxy("POST")
 
     def do_GET(self):
-        # Local health endpoint — returns immediately without forwarding
-        if self.path in ("/health", "/health/readiness"):
+        # Local health endpoints — return immediately without forwarding
+        if self.path == "/health":
             body = b'{"status":"ok"}'
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/health/readiness":
+            status_code, payload = _backend_readiness()
+            body = json.dumps(payload).encode()
+            self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -1600,15 +1557,14 @@ class BoundedThreadServer(HTTPServer):
 
     def process_request(self, req, addr):
         if not self._semaphore.acquire(blocking=False):
-            # Pool is full — reject immediately
+            # Pool is full — reject immediately with canonical overload envelope
+            code, body = _error_response(503, "Server overloaded", "overload_error")
             try:
-                req.sendall(
-                    b"HTTP/1.1 503 Service Unavailable\r\n"
-                    b"Content-Type: application/json\r\n"
-                    b"Content-Length: 62\r\n"
-                    b"Connection: close\r\n\r\n"
-                    b'{"error":{"message":"Server overloaded","type":"overload_error"}}'
-                )
+                req.sendall(b"HTTP/1.1 %d \r\n" % code)
+                req.sendall(b"Content-Type: application/json\r\n")
+                req.sendall(b"Content-Length: %d\r\n" % len(body))
+                req.sendall(b"Connection: close\r\n\r\n")
+                req.sendall(body)
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 log.debug("503 overload response failed (client gone): %s", e)
             self.shutdown_request(req)
@@ -1622,6 +1578,15 @@ class BoundedThreadServer(HTTPServer):
         except Exception as e:
             log.error("Unhandled request error for %s: %s", addr, e, exc_info=True)
             _inc_counter("handler_errors")
+            code, body = _error_response(500, "Internal proxy error", "proxy_error")
+            try:
+                req.sendall(b"HTTP/1.1 500 Internal Server Error\r\n")
+                req.sendall(b"Content-Type: application/json\r\n")
+                req.sendall(("Content-Length: %d\r\n" % len(body)).encode())
+                req.sendall(b"Connection: close\r\n\r\n")
+                req.sendall(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                log.debug("Handler error response could not be sent to %s (client gone)", addr)
         finally:
             self.shutdown_request(req)
             self._semaphore.release()

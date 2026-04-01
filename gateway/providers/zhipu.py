@@ -41,7 +41,7 @@ class ZhipuProvider(BaseProvider):
             return Status.NOT_CONFIGURED, "ZAI_API_KEY not set"
 
         probe_model = next(iter(self.models))
-        log.debug("Validating Zhipu credentials with model %s", probe_model)
+        log.debug("Validating Z.AI credentials with model %s", probe_model)
 
         try:
             resp = requests.post(
@@ -56,33 +56,10 @@ class ZhipuProvider(BaseProvider):
         except requests.RequestException as e:
             return Status.UNREACHABLE, f"Cannot reach Z.AI API: {e}"
 
-        if resp.status_code in (401, 403):
-            return Status.INVALID, "Invalid ZAI_API_KEY"
-        if resp.status_code == 429:
-            return Status.UNREACHABLE, "Z.AI rate limited — credential not verified"
-        if resp.status_code >= 500:
-            return Status.UNREACHABLE, f"Z.AI server error (HTTP {resp.status_code})"
-        if resp.status_code != 200:
-            log.warning("Z.AI returned unexpected status %d", resp.status_code)
-            return Status.UNREACHABLE, f"Z.AI returned unexpected status {resp.status_code}"
-
-        ct = resp.headers.get("Content-Type", "")
-        if "application/json" not in ct:
-            log.warning("Z.AI returned unexpected Content-Type: %s", ct)
-            return Status.UNREACHABLE, f"Z.AI returned unexpected Content-Type: {ct}"
-
-        try:
-            data = resp.json()
-        except ValueError:
-            return Status.UNREACHABLE, "Z.AI returned invalid JSON"
-
-        if isinstance(data, dict) and "error" in data:
-            err = data["error"]
-            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-            log.warning("Z.AI returned error in 200 response: %s", msg)
-            return Status.INVALID, f"Z.AI error: {msg}"
-
-        return Status.OK, "Authenticated with Z.AI"
+        status, _ = self._classify_response(resp)
+        if status == Status.OK:
+            return status, "Authenticated with Z.AI"
+        return status, _
 
     login_prompts = {
         "api_key": {

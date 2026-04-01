@@ -108,3 +108,36 @@ class BaseProvider(ABC):
             "levels": self.thinking_levels,
             "requires_openai_translation": True,
         }
+
+    def _classify_response(self, resp):
+        """Classify an HTTP response from a validation probe.
+
+        Shared logic for all providers: transport errors, HTTP status classification,
+        content-type validation, JSON parsing, and 200-with-error-envelope detection.
+
+        Returns (Status, message_string) — caller returns directly.
+        """
+        if resp.status_code in (401, 403):
+            return Status.INVALID, f"Invalid or forbidden credentials (HTTP {resp.status_code})"
+        if resp.status_code == 429:
+            return Status.UNREACHABLE, "Rate limited — credential not verified"
+        if resp.status_code >= 500:
+            return Status.UNREACHABLE, f"Provider server error (HTTP {resp.status_code}) — key not validated"
+        if resp.status_code != 200:
+            return Status.UNREACHABLE, f"Unexpected status {resp.status_code}"
+
+        ct = resp.headers.get("Content-Type", "")
+        if "application/json" not in ct:
+            return Status.UNREACHABLE, f"Unexpected Content-Type: {ct}"
+
+        try:
+            data = resp.json()
+        except ValueError:
+            return Status.UNREACHABLE, "Non-JSON response"
+
+        if isinstance(data, dict) and "error" in data:
+            err = data["error"]
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            return Status.INVALID, f"Provider error: {msg}"
+
+        return Status.OK, ""

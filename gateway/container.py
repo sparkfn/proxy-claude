@@ -28,7 +28,7 @@ def status():
             return Status.OK, "LiteLLM is running"
         return Status.UNREACHABLE, f"LiteLLM returned status {resp.status_code}"
     except requests.RequestException as e:
-        log.debug("LiteLLM health check failed: %s", e)
+        log.warning("LiteLLM health check failed: %s", e)
         return Status.UNREACHABLE, f"Cannot reach LiteLLM at {LITELLM_HOST}:{LITELLM_PORT}"
 
 
