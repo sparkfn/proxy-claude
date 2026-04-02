@@ -256,6 +256,19 @@ case "$CMD" in
         # Output is trusted (our own container) — safe to eval.
         eval "$env_output"
 
+        # Write any collected credentials to .env on the HOST (container can't write bind-mounts)
+        for var in $(env | grep '^SET_ENV_' | cut -d= -f1); do
+            env_key="${var#SET_ENV_}"
+            env_val="${!var}"
+            if grep -q "^${env_key}=" "$DIR/.env" 2>/dev/null; then
+                sed -i.bak "s|^${env_key}=.*|${env_key}=${env_val}|" "$DIR/.env"
+                rm -f "$DIR/.env.bak"
+            else
+                echo "${env_key}=${env_val}" >> "$DIR/.env"
+            fi
+            echo "  Saved ${env_key} to .env"
+        done
+
         # If credentials were entered during launch, restart so LiteLLM picks them up
         if [ "${NEEDS_RESTART:-}" = "1" ]; then
             echo "  Restarting services to apply new credentials..."
@@ -311,6 +324,10 @@ case "$CMD" in
             echo "" >&2
         fi
 
+        if [ -z "${LAUNCH_CMD:-}" ]; then
+            echo "  ✗ Launch command not set. Check container logs."
+            exit 1
+        fi
         echo "  Launching Claude Code (${ANTHROPIC_MODEL:-unknown})..."
         # shellcheck disable=SC2086
         exec $LAUNCH_CMD

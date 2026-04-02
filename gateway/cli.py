@@ -682,9 +682,17 @@ def cmd_model_rm(provider_flag=None, model_flag=None, extra_args=None):
 
 # --- Launch commands ---
 
+# Credentials collected during inline setup — written to emit-env for host-side .env update
+_pending_credentials = {}
+
+
 def _launch_inline_setup(entry, out):
-    """Prompt for credentials inline during launch. Returns True if provider becomes ready."""
-    import config
+    """Prompt for credentials inline during launch. Returns True if successful.
+
+    Does NOT write to .env (bind-mount prevents it). Instead stores
+    credentials in _pending_credentials for the emit-env output.
+    The shell script writes them to .env on the host side.
+    """
     provider = entry["provider_obj"]
     for auth_type, prompts in getattr(provider, "login_prompts", {}).items():
         if not prompts or not prompts.get("fields"):
@@ -699,22 +707,11 @@ def _launch_inline_setup(entry, out):
             if not value:
                 out("  Skipped.")
                 return False
-            try:
-                config.set_env(env_var, value)
-            except RuntimeError as e:
-                out(f"  {e}")
-                return False
-            out(f"  Saved {env_var}")
-        # Re-check readiness
-        env_data = config.load_env_file(config.ENV_PATH)
-        auth_dir = os.path.join(config.DIR, "auth")
-        ready, reason = provider.check_ready(env_data, auth_dir=auth_dir)
-        if ready:
-            entry["ready"] = True
-            entry["_needs_restart"] = True
-            return True
-        out(f"  Still not ready: {reason}")
-        return False
+            _pending_credentials[env_var] = value
+            out(f"  ✓ {env_var} collected")
+        entry["ready"] = True
+        entry["_needs_restart"] = True
+        return True
 
     # No login_prompts (e.g. browser OAuth or Ollama)
     if "browser_oauth" in getattr(provider, "auth_types", []):
@@ -965,6 +962,9 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
             f.write(f"LAUNCH_CMD='{cmd_parts}'\n")
             if _credentials_changed:
                 f.write("NEEDS_RESTART=1\n")
+            # Pass collected credentials to shell for host-side .env write
+            for cred_key, cred_val in _pending_credentials.items():
+                f.write(f"SET_ENV_{cred_key}='{cred_val}'\n")
         return
 
     # Normal mode: exec claude
