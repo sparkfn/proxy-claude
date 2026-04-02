@@ -863,6 +863,7 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
         s, msg = config.add_model(model["alias"], model["model"], extra)
         if s == Status.OK:
             out(f"  Added {model['alias']} to config")
+            _credentials_changed = True  # Config changed — need restart
 
     # Step 4: skip — check_ready() already validated credentials locally.
     # Full network validation (validate()) is too slow and depends on LiteLLM

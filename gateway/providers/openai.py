@@ -50,6 +50,9 @@ class OpenAIProvider(BaseProvider):
     def get_models_for_auth(self, auth_type):
         return self.models
 
+    def get_extra_params(self):
+        return {"drop_params": True, "modify_params": True, "supports_system_messages": False}
+
     def resolve_thinking_contract(self, alias, litellm_model, litellm_params=None):
         levels = self._get_model_thinking_levels(alias) or self.thinking_levels
         if litellm_model.startswith("chatgpt/"):
