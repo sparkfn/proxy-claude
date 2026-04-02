@@ -854,16 +854,18 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
                      "litellm_params": {"model": entry["model"]}}
 
     # Ensure selected model exists in litellm_config.yaml
-    existing_aliases = {m["alias"] for m in config.list_models()}
-    if model["alias"] not in existing_aliases:
-        provider = providers.get_provider(model["provider"])
-        extra = {}
-        if hasattr(provider, "get_extra_params"):
-            extra = provider.get_extra_params()
-        s, msg = config.add_model(model["alias"], model["model"], extra)
-        if s == Status.OK:
-            out(f"  Added {model['alias']} to config")
-            _credentials_changed = True  # Config changed — need restart
+    # Skip for browser OAuth — model added by shell AFTER auth succeeds
+    if not _needs_browser_oauth:
+        existing_aliases = {m["alias"] for m in config.list_models()}
+        if model["alias"] not in existing_aliases:
+            provider = providers.get_provider(model["provider"])
+            extra = {}
+            if hasattr(provider, "get_extra_params"):
+                extra = provider.get_extra_params()
+            s, msg = config.add_model(model["alias"], model["model"], extra)
+            if s == Status.OK:
+                out(f"  Added {model['alias']} to config")
+                _credentials_changed = True  # Config changed — need restart
 
     # Step 4: skip — check_ready() already validated credentials locally.
     # Full network validation (validate()) is too slow and depends on LiteLLM

@@ -275,9 +275,23 @@ case "$CMD" in
             _wait_for_gateway
         fi
 
-        # OpenAI browser OAuth: trigger device-code flow and guide user through it
+        # OpenAI browser OAuth: add model to config, trigger device-code, guide user
         if [ "${NEEDS_BROWSER_OAUTH:-}" = "1" ]; then
-            # Trigger the auth flow — LiteLLM emits device code after a real request
+            # Add model to config so LiteLLM can route the trigger request
+            _gateway_exec python -c "
+import config
+existing = {m['alias'] for m in config.list_models()}
+if '${ANTHROPIC_MODEL}' not in existing:
+    config.add_model('${ANTHROPIC_MODEL}', 'chatgpt/${ANTHROPIC_MODEL}',
+        {'drop_params': True, 'modify_params': True, 'supports_system_messages': False})
+" 2>/dev/null || true
+
+            # Restart to load the new model
+            echo "  Starting OpenAI authentication..."
+            _docker_compose up -d --force-recreate
+            _wait_for_gateway
+
+            # Trigger the auth flow
             _gateway_exec python cli.py provider openai-browser-trigger $VERBOSE 2>/dev/null || true
             echo ""
             echo "  Waiting for login instructions from LiteLLM..."
@@ -300,16 +314,31 @@ case "$CMD" in
                 echo "  └─────────────────────────────────────────────────────┘"
                 echo ""
                 echo "  Complete the login in your browser, then wait..."
+                oauth_ok=0
                 for _ in $(seq 1 100); do
                     if curl -s -o /dev/null -w '%{http_code}' http://localhost:2555/health/readiness 2>/dev/null | grep -q 200; then
-                        echo "  ✓ LiteLLM is ready"
+                        echo "  ✓ Authenticated"
+                        oauth_ok=1
                         break
                     fi
                     sleep 3
                 done
+                if [ "$oauth_ok" = "0" ]; then
+                    echo ""
+                    echo "  ✗ Authentication timed out."
+                    # Remove the model so it doesn't block other models on next start
+                    _gateway_exec python -c "import config; config.remove_model('${ANTHROPIC_MODEL}')" 2>/dev/null || true
+                    _docker_compose up -d --force-recreate 2>/dev/null
+                    exit 1
+                fi
             else
                 echo ""
-                echo "  ⚠ Could not find OpenAI login URL. Check './proclaude.sh logs litellm'"
+                echo "  ⚠ Could not find OpenAI login URL."
+                echo "    Check './proclaude.sh logs litellm' for details."
+                # Remove the model so it doesn't block other models
+                _gateway_exec python -c "import config; config.remove_model('${ANTHROPIC_MODEL}')" 2>/dev/null || true
+                _docker_compose up -d --force-recreate 2>/dev/null
+                exit 1
             fi
         fi
 
