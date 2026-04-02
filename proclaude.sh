@@ -345,9 +345,9 @@ case "$CMD" in
             fi
         fi
 
-        # Brief wait for LiteLLM backend (avoids 502 on first request)
+        # Wait for LiteLLM backend to be ready before launching claude
         ready_wait=0
-        while [ $ready_wait -lt 30 ]; do
+        while [ $ready_wait -lt 90 ]; do
             if curl -s -o /dev/null -w '%{http_code}' http://localhost:2555/health/readiness 2>/dev/null | grep -q 200; then
                 break
             fi
@@ -355,11 +355,15 @@ case "$CMD" in
                 printf "  Waiting for backend" >&2
             fi
             printf "." >&2
-            sleep 1
+            sleep 2
             ready_wait=$((ready_wait + 1))
         done
         if [ $ready_wait -gt 0 ]; then
             echo "" >&2
+        fi
+        # Verify backend is actually ready
+        if ! curl -s -o /dev/null -w '%{http_code}' http://localhost:2555/health/readiness 2>/dev/null | grep -q 200; then
+            echo "  ⚠ Backend not ready yet. Claude may retry on first request."
         fi
 
         if [ -z "${LAUNCH_CMD:-}" ]; then
