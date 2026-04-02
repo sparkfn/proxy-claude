@@ -4,7 +4,6 @@ set -euo pipefail
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 COMPOSE_FILE="$DIR/docker-compose.yml"
 GATEWAY_CONTAINER="litellm-gateway"
-HOST_RUNTIME="$DIR/gateway/host_runtime.py"
 
 # --- Helpers (UI only — no business logic) ---
 
@@ -115,14 +114,36 @@ mkdir -p "$DIR/auth/chatgpt" "$DIR/data" "$DIR/data/gateway"
 CMD="$1"
 shift
 
+_ensure_env() {
+    # Ensure .env exists and has a master key (pure bash, no Python)
+    if [ ! -f "$DIR/.env" ]; then
+        if [ -f "$DIR/.env.example" ]; then
+            cp "$DIR/.env.example" "$DIR/.env"
+        else
+            touch "$DIR/.env"
+        fi
+        chmod 600 "$DIR/.env"
+    fi
+    if ! grep -q '^LITELLM_MASTER_KEY=.\+' "$DIR/.env" 2>/dev/null; then
+        local key
+        key=$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        if grep -q '^LITELLM_MASTER_KEY=' "$DIR/.env" 2>/dev/null; then
+            sed -i.bak "s/^LITELLM_MASTER_KEY=.*/LITELLM_MASTER_KEY=$key/" "$DIR/.env"
+            rm -f "$DIR/.env.bak"
+        else
+            echo "LITELLM_MASTER_KEY=$key" >> "$DIR/.env"
+        fi
+    fi
+}
+
 case "$CMD" in
     start)
-        python3 "$HOST_RUNTIME" ensure-master-key
+        _ensure_env
         echo "  Starting services..."
         _docker_compose up -d --build
         _wait_for_gateway
         echo "  ✓ Gateway running on http://localhost:2555"
-        python3 "$HOST_RUNTIME" --compose-file "$COMPOSE_FILE" report-start-status
+        _gateway_exec python cli.py start-status $VERBOSE || true
         ;;
     stop)
         _docker_compose down
@@ -151,12 +172,49 @@ case "$CMD" in
     provider)
         if [ "${1:-}" = "login" ] && [ "${2:-}" = "openai" ]; then
             if ! _gateway_running; then
+                _ensure_env
                 echo "  Starting services..."
                 _docker_compose up -d --build
                 _wait_for_gateway
             fi
             shift 2
-            python3 "$HOST_RUNTIME" --compose-file "$COMPOSE_FILE" openai-browser-login "$@"
+            # Browser OAuth needs host-side docker log access
+            _gateway_exec python cli.py provider openai-browser-trigger $VERBOSE || true
+            echo ""
+            echo "  Waiting for login instructions from LiteLLM..."
+            login_url=""
+            for _ in $(seq 1 30); do
+                login_url=$(_docker_compose logs --tail 80 litellm 2>&1 | grep -o 'https://auth\.openai\.com/[^ "]*' | tail -1)
+                [ -n "$login_url" ] && break
+                printf "." >&2
+                sleep 2
+            done
+            if [ -z "$login_url" ]; then
+                echo ""
+                echo "  ✗ Could not find OpenAI login URL in LiteLLM logs."
+                echo "    Check './proclaude.sh logs litellm' for details."
+                exit 1
+            fi
+            device_code=$(_docker_compose logs --tail 80 litellm 2>&1 | grep -o 'Enter code: [A-Z0-9-]*' | tail -1 | sed 's/Enter code: //')
+            echo ""
+            echo "  ┌─────────────────────────────────────────────────────┐"
+            echo "  │  OpenAI Login Required                              │"
+            echo "  │                                                     │"
+            printf "  │  1) Visit:  %-42s│\n" "$login_url"
+            printf "  │  2) Enter code:  %-36s│\n" "$device_code"
+            echo "  │                                                     │"
+            echo "  └─────────────────────────────────────────────────────┘"
+            echo ""
+            echo "  Waiting for login confirmation... (timeout: 5 min)"
+            for _ in $(seq 1 100); do
+                if _docker_compose logs --tail 120 litellm 2>&1 | grep -qi "successfully authenticated\|chatgpt.*auth\|access.token"; then
+                    echo "  ✓ Browser OAuth may be active."
+                    exit 0
+                fi
+                sleep 3
+            done
+            echo "  ✗ Login timed out."
+            exit 1
         else
             _ensure_running
             _gateway_exec python cli.py provider "$@" $VERBOSE
@@ -205,12 +263,35 @@ case "$CMD" in
             _wait_for_gateway
         fi
 
-        # Only check OpenAI pending auth if the selected provider is OpenAI
+        # For OpenAI browser OAuth: check if auth is pending
         if [ "${CLAUDE_SELECTED_PROVIDER:-}" = "openai" ]; then
-            python3 "$HOST_RUNTIME" \
-                --compose-file "$COMPOSE_FILE" \
-                offer-pending-auth \
-                --selected-model "${ANTHROPIC_MODEL:-selected model}"
+            if ! curl -s -o /dev/null -w '%{http_code}' http://localhost:2555/health/readiness 2>/dev/null | grep -q 200; then
+                auth_url=$(_docker_compose logs --tail 30 litellm 2>&1 | grep -o 'https://auth\.openai\.com/[^ "]*' | tail -1)
+                if [ -n "$auth_url" ]; then
+                    device_code=$(_docker_compose logs --tail 30 litellm 2>&1 | grep -o 'Enter code: [A-Z0-9-]*' | tail -1 | sed 's/Enter code: //')
+                    echo ""
+                    echo "  ┌─────────────────────────────────────────────────────┐"
+                    echo "  │  OpenAI Login Required                              │"
+                    echo "  │                                                     │"
+                    printf "  │  1) Visit:  %-42s│\n" "$auth_url"
+                    printf "  │  2) Enter code:  %-36s│\n" "$device_code"
+                    echo "  │                                                     │"
+                    echo "  └─────────────────────────────────────────────────────┘"
+                    echo ""
+                    printf "  Authenticate now before launching? [Y/n]: "
+                    read -r auth_choice
+                    if [ "${auth_choice:-Y}" != "n" ] && [ "${auth_choice:-Y}" != "N" ]; then
+                        echo "  Waiting for login..."
+                        for _ in $(seq 1 100); do
+                            if curl -s -o /dev/null -w '%{http_code}' http://localhost:2555/health/readiness 2>/dev/null | grep -q 200; then
+                                echo "  ✓ LiteLLM is ready"
+                                break
+                            fi
+                            sleep 3
+                        done
+                    fi
+                fi
+            fi
         fi
 
         # Brief wait for LiteLLM backend (avoids 502 on first request)

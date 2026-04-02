@@ -110,6 +110,7 @@ SUBCOMMAND_REGISTRY = {
         "status": (None, "status", "Show auth status per provider"),
         "login":  (None, "login [name]", "Authenticate with a provider"),
         "logout": (None, "logout [name]", "Remove provider credentials"),
+        "openai-browser-trigger": (None, "openai-browser-trigger", "Trigger OpenAI device-code flow"),
     },
     "launch": {
         "claude": (None, "claude [--provider X] [--model Y] [--thinking <level>] [--telegram|--no-telegram] [--emit-env <path>] [-- args...]", "Launch Claude Code through the proxy"),
@@ -126,6 +127,52 @@ def _show_group_help(group):
     print(f"Usage: {name} {group} <subcommand>\n")
     for _sub, (_handler, usage_str, desc) in entries.items():
         print(f"  {name} {group} {usage_str:<40} {desc}")
+
+
+def cmd_openai_browser_trigger(provider_flag=None, model_flag=None, extra_args=None, **_kwargs):
+    """Trigger OpenAI browser OAuth device-code flow by sending a dummy request."""
+    import config
+    import requests
+    master_key = config.get_env("LITELLM_MASTER_KEY") or ""
+    chatgpt_models = [m["alias"] for m in config.list_models() if m.get("model", "").startswith("chatgpt/")]
+    if not chatgpt_models:
+        print("  ✗ No chatgpt/ models configured.")
+        sys.exit(1)
+    try:
+        requests.post(
+            f"http://localhost:{PORT}/v1/chat/completions",
+            json={"model": chatgpt_models[0], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+            headers={"Authorization": f"Bearer {master_key}", "Content-Type": "application/json"},
+            timeout=10,
+        )
+    except Exception:
+        pass  # Expected to fail — just triggers the device code in LiteLLM logs
+
+
+def cmd_start_status():
+    """Quick post-start status: backend reachability + model auth readiness."""
+    import container
+    import config
+    import providers
+
+    cs, _ = container.status()
+    if cs == Status.OK:
+        print("  ✓ LiteLLM backend is reachable")
+    else:
+        print("  ⚠ LiteLLM backend not yet reachable (may still be starting)")
+
+    env_data = config.load_env_file(config.ENV_PATH)
+    auth_dir = os.path.join(config.DIR, "auth")
+    print("")
+    print("  Models:")
+    for provider in providers.all_providers():
+        if not provider.models:
+            continue
+        ready, reason = provider.check_ready(env_data, auth_dir=auth_dir)
+        alias = next(iter(provider.models))
+        icon = "✓" if ready else "✗"
+        label = "ready" if ready else reason
+        print(f"    {icon} {alias:<16} {provider.display_name:<10} {label}")
 
 
 def cmd_status():
@@ -947,7 +994,8 @@ def _init_registry():
     handlers = {
         "model": {"add": cmd_model_add, "rm": cmd_model_rm, "list": cmd_model_list},
         "provider": {"list": cmd_provider_list, "status": cmd_provider_status,
-                     "login": cmd_provider_login, "logout": cmd_provider_logout},
+                     "login": cmd_provider_login, "logout": cmd_provider_logout,
+                     "openai-browser-trigger": cmd_openai_browser_trigger},
         "launch": {"claude": cmd_launch_claude},
     }
     for group, subs in handlers.items():
@@ -1018,6 +1066,10 @@ def main():
     if cmd in ("start", "stop", "restart", "logs"):
         print(f"  '{cmd}' is handled by proclaude.sh directly.")
         print(f"  Run: ./proclaude.sh {cmd}")
+        return
+
+    if cmd == "start-status":
+        cmd_start_status()
         return
 
     if cmd == "status":
