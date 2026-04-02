@@ -22,9 +22,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import config
-
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 DEFAULT_GATEWAY_URL = "http://127.0.0.1:2555"
@@ -33,6 +30,81 @@ AUTH_CODE_RE = re.compile(r"Enter code:\s*([A-Z0-9]+-[A-Z0-9]+)")
 AUTH_SUCCESS_RE = re.compile(
     r"(?i)(successfully authenticated|chatgpt.*auth|session.*authenticated|access.token)"
 )
+ENV_PATH = REPO_ROOT / ".env"
+ENV_BACKUP = REPO_ROOT / ".env.bak"
+ENV_EXAMPLE = REPO_ROOT / ".env.example"
+
+
+def _strip_quotes(value: str) -> str:
+    if len(value) >= 2:
+        if (value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'"):
+            return value[1:-1]
+    return value
+
+
+def _ensure_env_file() -> None:
+    import shutil, stat
+    if ENV_PATH.exists():
+        return
+    if ENV_EXAMPLE.exists():
+        shutil.copy2(ENV_EXAMPLE, ENV_PATH)
+    else:
+        ENV_PATH.write_text("", encoding="utf-8")
+    ENV_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _read_env_lines() -> list[str]:
+    _ensure_env_file()
+    return ENV_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+
+
+def _write_env_lines(lines: list[str]) -> None:
+    import shutil, stat
+    if ENV_PATH.exists():
+        shutil.copy2(ENV_PATH, ENV_BACKUP)
+    ENV_PATH.write_text("".join(lines), encoding="utf-8")
+    ENV_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _get_env(key: str) -> str | None:
+    for line in _read_env_lines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        current_key, _, value = stripped.partition("=")
+        if current_key.strip() == key:
+            return _strip_quotes(value.strip())
+    return None
+
+
+def _set_env(key: str, value: str) -> None:
+    lines = _read_env_lines()
+    found = False
+    updated: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("#") and "=" in stripped:
+            current_key, _, _ = stripped.partition("=")
+            if current_key.strip() == key:
+                updated.append(f"{key}={value}\n")
+                found = True
+                continue
+        updated.append(line)
+    if not found:
+        if updated and not updated[-1].endswith("\n"):
+            updated.append("\n")
+        updated.append(f"{key}={value}\n")
+    _write_env_lines(updated)
+
+
+def _ensure_master_key() -> str:
+    import secrets
+    master_key = _get_env("LITELLM_MASTER_KEY")
+    if master_key:
+        return master_key
+    master_key = secrets.token_hex(16)
+    _set_env("LITELLM_MASTER_KEY", master_key)
+    return master_key
 
 
 def _docker_compose_logs(compose_file: str, service: str, tail: int = 30) -> str:
@@ -210,13 +282,37 @@ def _gateway_json_with_auth(url: str, path: str, master_key: str) -> tuple[int |
         return None, None
 
 
+def _configured_chatgpt_models(compose_file: str) -> list[str]:
+    """Get chatgpt/ model aliases via docker exec into the gateway container."""
+    script = (
+        "import json, config; "
+        "print(json.dumps([m['alias'] for m in config.list_models() "
+        "if m.get('model', '').startswith('chatgpt/')]))"
+    )
+    try:
+        output = subprocess.check_output(
+            ["docker", "compose", "-f", compose_file, "exec", "-T",
+             "gateway", "python", "-c", script],
+            text=True, stderr=subprocess.STDOUT,
+        )
+    except subprocess.CalledProcessError:
+        return []
+    try:
+        models = json.loads(output)
+    except ValueError:
+        return []
+    if not isinstance(models, list):
+        return []
+    return [m for m in models if isinstance(m, str)]
+
+
 def _openai_browser_login(compose_file: str, gateway_url: str, timeout: int) -> int:
-    chatgpt_models = [m["alias"] for m in config.list_models() if m["model"].startswith("chatgpt/")]
+    chatgpt_models = _configured_chatgpt_models(compose_file)
     if not chatgpt_models:
         print("  ✗ No chatgpt/ models configured. Add one before using OpenAI browser OAuth.")
         return 1
 
-    master_key = config.get_env("LITELLM_MASTER_KEY")
+    master_key = _get_env("LITELLM_MASTER_KEY")
     if not master_key:
         print("  ✗ LITELLM_MASTER_KEY not set. Run './proclaude.sh start' first.")
         return 1
@@ -311,7 +407,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report-start-status":
         return _report_start_status(args.compose_file, args.gateway_url)
     if args.command == "ensure-master-key":
-        config.ensure_master_key()
+        _ensure_master_key()
         return 0
     if args.command == "offer-pending-auth":
         return _offer_pending_auth(

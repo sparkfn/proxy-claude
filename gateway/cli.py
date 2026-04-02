@@ -517,7 +517,8 @@ def cmd_model_add(provider_flag=None, model_flag=None, extra_args=None):
     # Step 5: Add each model
     added = []
     for alias in selected:
-        model_str = catalog[alias]
+        entry = catalog[alias]
+        model_str = entry["model"] if isinstance(entry, dict) else entry
         final_alias = alias
         if alias in existing_aliases:
             print(f"\n  Alias '{alias}' already exists.")
@@ -634,6 +635,46 @@ def cmd_model_rm(provider_flag=None, model_flag=None, extra_args=None):
 
 # --- Launch commands ---
 
+def _launch_inline_setup(entry, out):
+    """Prompt for credentials inline during launch. Returns True if provider becomes ready."""
+    import config
+    provider = entry["provider_obj"]
+    for auth_type, prompts in getattr(provider, "login_prompts", {}).items():
+        if not prompts or not prompts.get("fields"):
+            continue
+        instructions = prompts.get("instructions", "")
+        if instructions:
+            out(f"\n  {instructions}\n")
+        for env_var, prompt_text in prompts["fields"]:
+            value = input(f"  {prompt_text}").strip()
+            if not value:
+                out("  Skipped.")
+                return False
+            try:
+                config.set_env(env_var, value)
+            except RuntimeError as e:
+                out(f"  {e}")
+                return False
+            out(f"  Saved {env_var}")
+        # Re-check readiness
+        env_data = config.load_env_file(config.ENV_PATH)
+        auth_dir = os.path.join(config.DIR, "auth")
+        ready, reason = provider.check_ready(env_data, auth_dir=auth_dir)
+        if ready:
+            entry["ready"] = True
+            return True
+        out(f"  Still not ready: {reason}")
+        return False
+
+    # No login_prompts (e.g. browser OAuth or Ollama)
+    if "browser_oauth" in getattr(provider, "auth_types", []):
+        out("  OpenAI browser auth required.")
+        out("    Run: ./proclaude.sh provider login openai")
+        return False
+    out(f"  {entry['ready_reason']}")
+    return False
+
+
 def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thinking=None, **_kwargs):
     """Launch Claude Code through the LiteLLM proxy."""
     import shutil
@@ -666,76 +707,123 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
         out("  \u26a0 LiteLLM backend not yet reachable (may still be starting)")
         out("    If upstream auth is pending, you can finish it after model selection")
 
-    # Step 3: Pick model — skip provider validation for speed
-    configured_models = config.list_models()
+    # Step 3: Build catalog from provider registry with readiness checks.
+    # Uses check_ready() for fast local checks instead of network-calling validate().
+    env_data = config.load_env_file(config.ENV_PATH)
+    auth_dir = os.path.join(config.DIR, "auth")
+    all_entries = []
+    for provider in providers.all_providers():
+        ready, reason = provider.check_ready(env_data, auth_dir=auth_dir)
+        for alias, entry in provider.models.items():
+            litellm_model = entry["model"] if isinstance(entry, dict) else entry
+            all_entries.append({
+                "alias": alias,
+                "provider": provider.name,
+                "display_name": provider.display_name,
+                "model": litellm_model,
+                "ready": ready,
+                "ready_reason": reason,
+                "provider_obj": provider,
+            })
 
-    if not configured_models:
-        out("  \u2717 No models configured.")
-        out("    Run: ./proclaude.sh model add")
+    if not all_entries:
+        out("  No models available.")
         sys.exit(1)
 
-    # Hide configured Ollama entries that are not currently available locally.
-    available_ollama = None
-    candidates = []
-    for configured_model in configured_models:
-        if configured_model["provider"] != "ollama":
-            candidates.append(configured_model)
-            continue
-
-        import providers as _providers
-        ollama_provider = _providers.get_provider("ollama")
-        if not ollama_provider:
-            continue
-        if available_ollama is None:
-            available_ollama = ollama_provider.discover_models()
-            if available_ollama is None:
-                available_ollama = {}
-        if configured_model["alias"] in available_ollama:
-            candidates.append(configured_model)
-
-    # Filter by provider flag if given
+    # Filter by provider/model flags
     if provider_flag:
-        candidates = [m for m in candidates if m["provider"] == provider_flag]
-        if not candidates:
-            out(f"  \u2717 No models configured for provider '{provider_flag}'.")
+        all_entries = [e for e in all_entries if e["provider"] == provider_flag]
+        if not all_entries:
+            out(f"  No models for provider '{provider_flag}'.")
             sys.exit(1)
 
-    if not candidates:
-        out("  \u2717 No launchable models configured.")
-        out("    Run: ./proclaude.sh model add")
-        sys.exit(1)
-
-    # Filter by model flag if given
     if model_flag:
-        match = [m for m in candidates if m["alias"] == model_flag]
+        match = [e for e in all_entries if e["alias"] == model_flag]
         if not match:
-            out(f"  \u2717 Model '{model_flag}' not found.")
-            out(f"  Available: {', '.join(m['alias'] for m in candidates)}")
+            out(f"  Model '{model_flag}' not found.")
+            out(f"  Available: {', '.join(e['alias'] for e in all_entries)}")
             sys.exit(1)
-        model = match[0]
-    elif len(candidates) == 1:
-        model = candidates[0]
+        entry = match[0]
+        if not entry["ready"]:
+            out(f"  {entry['alias']} is not ready: {entry['ready_reason']}")
+            if not _launch_inline_setup(entry, out):
+                sys.exit(1)
+        model = {"alias": entry["alias"], "model": entry["model"], "provider": entry["provider"],
+                 "litellm_params": {"model": entry["model"]}}
     else:
-        out(f"\n  Select a model:\n")
-        for i, m in enumerate(candidates, 1):
-            out(f"    [{i}] {m['alias']} ({m['provider']})")
-        out("")
-        choice = input("  Choose: ").strip()
-        try:
-            model = candidates[int(choice) - 1]
-        except (ValueError, IndexError):
-            out("  Invalid choice.")
+        ready = [e for e in all_entries if e["ready"]]
+        not_ready = [e for e in all_entries if not e["ready"]]
+
+        if not ready and not not_ready:
+            out("  No models available.")
             sys.exit(1)
 
-    # Step 4: Validate the selected model's provider before any more prompts.
+        if not ready:
+            # No models ready — offer inline setup
+            out("\n  No models are ready yet. Let's set one up:\n")
+            for i, e in enumerate(all_entries, 1):
+                out(f"    [{i}] {e['alias']:<16} {e['display_name']:<10}  {e['ready_reason']}")
+            out("")
+            choice = input("  Choose: ").strip()
+            try:
+                entry = all_entries[int(choice) - 1]
+            except (ValueError, IndexError):
+                out("  Invalid choice.")
+                sys.exit(1)
+            if not _launch_inline_setup(entry, out):
+                sys.exit(1)
+            model = {"alias": entry["alias"], "model": entry["model"], "provider": entry["provider"],
+                     "litellm_params": {"model": entry["model"]}}
+        elif len(ready) == 1 and not not_ready:
+            entry = ready[0]
+            out(f"  Using {entry['alias']} ({entry['display_name']})")
+            model = {"alias": entry["alias"], "model": entry["model"], "provider": entry["provider"],
+                     "litellm_params": {"model": entry["model"]}}
+        else:
+            out("")
+            if ready:
+                out("  Ready:")
+                for i, e in enumerate(ready, 1):
+                    out(f"    [{i}] {e['alias']:<16} {e['display_name']}")
+            if not_ready:
+                out("")
+                out("  Not ready:")
+                for e in not_ready:
+                    out(f"    {e['alias']:<18} {e['display_name']:<10}  {e['ready_reason']}")
+            out("")
+            choice = input("  Choose [1]: ").strip() or "1"
+            try:
+                idx = int(choice) - 1
+                if idx < 0 or idx >= len(ready):
+                    out("  Invalid choice.")
+                    sys.exit(1)
+                entry = ready[idx]
+            except ValueError:
+                out("  Invalid choice.")
+                sys.exit(1)
+            model = {"alias": entry["alias"], "model": entry["model"], "provider": entry["provider"],
+                     "litellm_params": {"model": entry["model"]}}
+
+    # Ensure selected model exists in litellm_config.yaml
+    existing_aliases = {m["alias"] for m in config.list_models()}
+    if model["alias"] not in existing_aliases:
+        provider = providers.get_provider(model["provider"])
+        extra = {}
+        if hasattr(provider, "get_extra_params"):
+            extra = provider.get_extra_params()
+        s, msg = config.add_model(model["alias"], model["model"], extra)
+        if s == Status.OK:
+            out(f"  Added {model['alias']} to config")
+
+    # Step 4: Provider validation (full network check for the selected model).
     provider = providers.get_provider(model["provider"])
     if not provider:
-        out(f"  ✗ Unknown provider '{model['provider']}' for model '{model['alias']}'.")
+        out(f"  Unknown provider '{model['provider']}'.")
         sys.exit(1)
 
     provider_status, provider_msg = provider.validate()
     if provider_status not in (Status.OK, Status.UNVERIFIED):
-        out(f"  ✗ {model['alias']} is not ready: {provider_msg}")
+        out(f"  {model['alias']} is not ready: {provider_msg}")
         if provider.auth_types:
             out(f"    Run: ./proclaude.sh provider login {provider.name}")
         sys.exit(1)
@@ -801,13 +889,17 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
     # Check for --emit-env mode (used by proclaude.sh to get env without exec'ing)
     alias = model["alias"]
     _persist_selected_model_state(alias)
+
+    # Resolve model limits for the selected model
+    provider = providers.get_provider(model["provider"])
+    limits = getattr(provider, "model_limits", {}).get(alias) if provider else None
+
     if emit_env:
         with open(emit_env, "w") as f:
             f.write(f"export ANTHROPIC_BASE_URL='http://localhost:{PORT}'\n")
             f.write(f"export ANTHROPIC_AUTH_TOKEN='{master_key}'\n")
             f.write(f"export ANTHROPIC_MODEL='{alias}'\n")
             f.write(f"export CLAUDE_SELECTED_PROVIDER='{model['provider']}'\n")
-            # Map all Claude Code model tiers to the selected model
             f.write(f"export ANTHROPIC_DEFAULT_HAIKU_MODEL='{alias}'\n")
             f.write(f"export ANTHROPIC_DEFAULT_SONNET_MODEL='{alias}'\n")
             f.write(f"export ANTHROPIC_DEFAULT_OPUS_MODEL='{alias}'\n")
@@ -816,6 +908,17 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
             if telegram:
                 channel = os.environ.get("TELEGRAM_CHANNEL", "plugin:telegram@claude-plugins-official")
                 f.write(f"export CLAUDE_CHANNELS='{channel}'\n")
+            if limits:
+                if limits.get("context"):
+                    f.write(f"export CLAUDE_CODE_MAX_MODEL_TOKENS='{limits['context']}'\n")
+                if limits.get("max_output"):
+                    f.write(f"export MAX_OUTPUT_TOKENS='{limits['max_output']}'\n")
+            # Emit the command to run — shell just sources this and exec's LAUNCH_CMD
+            cmd_parts = "claude --dangerously-skip-permissions"
+            if telegram:
+                channel = os.environ.get("TELEGRAM_CHANNEL", "plugin:telegram@claude-plugins-official")
+                cmd_parts += f" --channels '{channel}'"
+            f.write(f"LAUNCH_CMD='{cmd_parts}'\n")
         return
 
     # Normal mode: exec claude

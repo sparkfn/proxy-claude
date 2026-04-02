@@ -89,7 +89,7 @@ SOCKET_TIMEOUT = _env_int("PROXY_SOCKET_TIMEOUT", 30)
 
 - [ ] **Step 2: Verify proxy.py still parses**
 
-Run: `cd /Users/noonoon/Dev/litellm-claude && python3 -c "import py_compile; py_compile.compile('proxy.py', doraise=True)"`
+Run: `cd /Users/noonoon/Dev/proxy-claude && python3 -c "import py_compile; py_compile.compile('proxy.py', doraise=True)"`
 Expected: No output (success)
 
 - [ ] **Step 3: Commit**
@@ -166,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
 
 - [ ] **Step 3: Verify**
 
-Run: `cd /Users/noonoon/Dev/litellm-claude && python3 -c "import py_compile; py_compile.compile('proxy.py', doraise=True)"`
+Run: `cd /Users/noonoon/Dev/proxy-claude && python3 -c "import py_compile; py_compile.compile('proxy.py', doraise=True)"`
 
 - [ ] **Step 4: Commit**
 
@@ -364,7 +364,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 5: Verify**
 
-Run: `cd /Users/noonoon/Dev/litellm-claude && python3 -c "import py_compile; py_compile.compile('proxy.py', doraise=True)"`
+Run: `cd /Users/noonoon/Dev/proxy-claude && python3 -c "import py_compile; py_compile.compile('proxy.py', doraise=True)"`
 
 - [ ] **Step 6: Commit**
 
@@ -555,7 +555,7 @@ def get_logs_tail(lines=200):
 
 - [ ] **Step 7: Verify**
 
-Run: `cd /Users/noonoon/Dev/litellm-claude && python3 -c "import py_compile; py_compile.compile('container.py', doraise=True)"`
+Run: `cd /Users/noonoon/Dev/proxy-claude && python3 -c "import py_compile; py_compile.compile('container.py', doraise=True)"`
 
 - [ ] **Step 8: Commit**
 
@@ -625,7 +625,7 @@ def _save_yaml(data):
 
 - [ ] **Step 3: Verify**
 
-Run: `cd /Users/noonoon/Dev/litellm-claude && python3 -c "import py_compile; py_compile.compile('config.py', doraise=True)"`
+Run: `cd /Users/noonoon/Dev/proxy-claude && python3 -c "import py_compile; py_compile.compile('config.py', doraise=True)"`
 
 - [ ] **Step 4: Commit**
 
@@ -767,7 +767,7 @@ Replace with:
 
 - [ ] **Step 4: Verify**
 
-Run: `cd /Users/noonoon/Dev/litellm-claude && python3 -c "import py_compile; py_compile.compile('providers/openai.py', doraise=True)"`
+Run: `cd /Users/noonoon/Dev/proxy-claude && python3 -c "import py_compile; py_compile.compile('providers/openai.py', doraise=True)"`
 
 - [ ] **Step 5: Commit**
 
@@ -890,7 +890,7 @@ git commit -m "fix(openai): validate response content-type/JSON, honest browser 
 
 - [ ] **Step 4: Verify**
 
-Run: `cd /Users/noonoon/Dev/litellm-claude && python3 -c "import py_compile; py_compile.compile('providers/ollama.py', doraise=True)"`
+Run: `cd /Users/noonoon/Dev/proxy-claude && python3 -c "import py_compile; py_compile.compile('providers/ollama.py', doraise=True)"`
 
 - [ ] **Step 5: Commit**
 
@@ -986,7 +986,7 @@ git commit -m "docs: comprehensive .env.example with all proxy tunables"
 - [ ] **Step 1: Verify all files compile**
 
 ```bash
-cd /Users/noonoon/Dev/litellm-claude
+cd /Users/noonoon/Dev/proxy-claude
 python3 -c "
 import py_compile
 for f in ['proxy.py', 'container.py', 'config.py', 'providers/openai.py', 'providers/ollama.py']:
@@ -999,7 +999,7 @@ print('All files compile successfully')
 - [ ] **Step 2: Verify proxy starts and stops cleanly**
 
 ```bash
-cd /Users/noonoon/Dev/litellm-claude
+cd /Users/noonoon/Dev/proxy-claude
 python3 proxy.py &
 PROXY_PID=$!
 sleep 1

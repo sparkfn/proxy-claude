@@ -28,6 +28,7 @@ services:
     volumes:
       - ./.env:/app/.env
       - ./litellm_config.yaml:/app/litellm_config.yaml
+      - ./auth:/app/auth:ro
     env_file:
       - .env
     environment:

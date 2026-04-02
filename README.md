@@ -1,4 +1,4 @@
-# LiteLLM Claude Gateway
+# proxy-claude
 
 A CLI-driven gateway that lets you run [Claude Code](https://claude.ai/code) through any LLM provider via [LiteLLM](https://github.com/BerryAI/litellm) proxy.
 
@@ -18,8 +18,8 @@ Claude Code → localhost:2555 → LiteLLM Proxy (Docker) → LLM Provider
 
 ```bash
 # 1. Clone
-git clone https://github.com/jaaacki/litellm-claude.git
-cd litellm-claude
+git clone https://github.com/sparkfn/proxy-claude.git
+cd proxy-claude
 
 # 2. Login to a provider
 ./proclaude.sh provider login openai

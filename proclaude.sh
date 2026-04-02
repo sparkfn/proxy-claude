@@ -6,18 +6,16 @@ COMPOSE_FILE="$DIR/docker-compose.yml"
 GATEWAY_CONTAINER="litellm-gateway"
 HOST_RUNTIME="$DIR/gateway/host_runtime.py"
 
-# --- Helpers ---
+# --- Helpers (UI only — no business logic) ---
 
 _docker_compose() {
     docker compose -f "$COMPOSE_FILE" "$@"
 }
 
 _gateway_exec() {
-    # Execute a CLI command inside the gateway container.
-    # Attach TTY only when both stdin and stdout are terminals (interactive use).
     local tty_flags=""
-    if [ -t 0 ] && [ -t 1 ]; then
-        tty_flags="-it"
+    if [ -t 0 ]; then
+        tty_flags="-i"
     fi
     # shellcheck disable=SC2086
     docker exec $tty_flags "$GATEWAY_CONTAINER" "$@"
@@ -45,81 +43,16 @@ _ensure_docker() {
     fi
 }
 
-# --- Launch claude (runs on host, no Python needed) ---
-# Interactive model/config selection runs inside the gateway container via
-# docker exec -it. cli.py --emit-env writes env vars to a temp file inside
-# the container. We read them back and exec claude on the host.
-
-_launch_claude() {
-    # Check claude binary on host
-    if ! command -v claude &>/dev/null; then
-        echo "  ✗ Claude Code CLI not found. Install it first:"
-        echo "    npm install -g @anthropic-ai/claude-code"
-        exit 1
-    fi
-
-    # Ensure services are running (auto-start if needed)
+_wait_for_gateway() {
+    local wait=0
+    while ! _gateway_running && [ $wait -lt 15 ]; do
+        sleep 1
+        wait=$((wait + 1))
+    done
     if ! _gateway_running; then
-        echo "  Starting services..."
-        _docker_compose up -d --build
-        # Brief wait for container readiness
-        local wait=0
-        while ! _gateway_running && [ $wait -lt 15 ]; do
-            sleep 1
-            wait=$((wait + 1))
-        done
-        if ! _gateway_running; then
-            echo "  ✗ Gateway failed to start. Check './proclaude.sh logs'"
-            exit 1
-        fi
-    fi
-
-    # Run the interactive launch flow inside the container.
-    # cli.py launch claude --emit-env /tmp/claude_env does:
-    #   1. Interactive model picker, thinking effort, telegram prompts (via TTY)
-    #   2. Writes shell-sourceable env vars to /tmp/claude_env inside container
-    local emit_path="/tmp/claude_env"
-    _gateway_exec python cli.py launch claude --emit-env "$emit_path" "$@"
-    local exit_code=$?
-    if [ $exit_code -ne 0 ]; then
-        exit $exit_code
-    fi
-
-    # Read the emitted env vars from the container
-    local env_output
-    env_output=$(docker exec "$GATEWAY_CONTAINER" cat "$emit_path" 2>/dev/null) || {
-        echo "  ✗ Failed to read launch configuration from container."
+        echo "  ✗ Gateway failed to start. Check './proclaude.sh logs'"
         exit 1
-    }
-    docker exec "$GATEWAY_CONTAINER" rm -f "$emit_path" 2>/dev/null || true
-
-    # Read and validate env vars from the container output.
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^export\ ([A-Za-z_][A-Za-z_0-9]*)=\'([^\']*)\'$ ]]; then
-            printf -v "${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
-            export "${BASH_REMATCH[1]}"
-        elif [[ -n "$line" ]]; then
-            echo "  Warning: skipping unexpected line in env output: $line" >&2
-        fi
-    done <<< "$env_output"
-
-    python3 "$HOST_RUNTIME" \
-        --compose-file "$COMPOSE_FILE" \
-        offer-pending-auth \
-        --selected-model "${ANTHROPIC_MODEL:-selected model}"
-
-    # Build the claude command
-    local cmd=(claude --dangerously-skip-permissions)
-    if [ -n "${CLAUDE_CHANNELS:-}" ]; then
-        cmd+=(--channels "$CLAUDE_CHANNELS")
     fi
-    if [ -n "${CLAUDE_EXTRA_ARGS:-}" ]; then
-        # shellcheck disable=SC2206
-        cmd+=($CLAUDE_EXTRA_ARGS)
-    fi
-
-    echo "  Launching Claude Code (${ANTHROPIC_MODEL:-unknown})..."
-    exec "${cmd[@]}"
 }
 
 # --- Help ---
@@ -158,7 +91,6 @@ HELP
 
 # --- Main ---
 
-# Parse --verbose / -v from anywhere in args
 VERBOSE=""
 args=()
 for arg in "$@"; do
@@ -170,7 +102,6 @@ for arg in "$@"; do
 done
 set -- "${args[@]+"${args[@]}"}"
 
-# No args or help
 if [ $# -eq 0 ] || [[ "$1" == "help" || "$1" == "-h" || "$1" == "--help" ]]; then
     _show_help
     exit 0
@@ -181,26 +112,12 @@ _ensure_docker
 CMD="$1"
 shift
 
-if [ "$CMD" = "start" ] && [ -z "${LITELLM_MASTER_KEY:-}" ]; then
-    if ! python3 "$HOST_RUNTIME" ensure-master-key; then
-        exit 1
-    fi
-fi
-
 case "$CMD" in
     start)
-        gw_wait=0
+        python3 "$HOST_RUNTIME" ensure-master-key
         echo "  Starting services..."
         _docker_compose up -d --build
-        # Wait for gateway container
-        while ! _gateway_running && [ $gw_wait -lt 15 ]; do
-            sleep 1
-            gw_wait=$((gw_wait + 1))
-        done
-        if ! _gateway_running; then
-            echo "  ✗ Gateway failed to start. Check './proclaude.sh logs'"
-            exit 1
-        fi
+        _wait_for_gateway
         echo "  ✓ Gateway running on http://localhost:2555"
         python3 "$HOST_RUNTIME" --compose-file "$COMPOSE_FILE" report-start-status
         ;;
@@ -233,15 +150,7 @@ case "$CMD" in
             if ! _gateway_running; then
                 echo "  Starting services..."
                 _docker_compose up -d --build
-                wait=0
-                while ! _gateway_running && [ $wait -lt 15 ]; do
-                    sleep 1
-                    wait=$((wait + 1))
-                done
-                if ! _gateway_running; then
-                    echo "  ✗ Gateway failed to start. Check './proclaude.sh logs'"
-                    exit 1
-                fi
+                _wait_for_gateway
             fi
             shift 2
             python3 "$HOST_RUNTIME" --compose-file "$COMPOSE_FILE" openai-browser-login "$@"
@@ -251,14 +160,49 @@ case "$CMD" in
         fi
         ;;
     launch)
-        if [ "${1:-}" = "claude" ]; then
-            shift
-            _launch_claude "$@" $VERBOSE
-        else
+        if [ "${1:-}" != "claude" ]; then
             echo "  Unknown launch target: ${1:-}"
             echo "  Available: claude"
             exit 1
         fi
+        shift
+
+        if ! command -v claude &>/dev/null; then
+            echo "  ✗ Claude Code CLI not found. Install it first:"
+            echo "    npm install -g @anthropic-ai/claude-code"
+            exit 1
+        fi
+
+        if ! _gateway_running; then
+            echo "  Starting services..."
+            _docker_compose up -d --build
+            _wait_for_gateway
+        fi
+
+        # Container handles: model picker, readiness checks, thinking, telegram,
+        # config management. Writes env + command to temp file.
+        emit_path="/tmp/claude_env"
+        _gateway_exec python cli.py launch claude --emit-env "$emit_path" "$@" $VERBOSE
+        # Reset terminal state after interactive docker exec TTY session
+        printf '\033[0m' 2>/dev/null || true
+        env_output=$(docker exec "$GATEWAY_CONTAINER" cat "$emit_path" 2>/dev/null) || {
+            echo "  ✗ Failed to read launch configuration."
+            exit 1
+        }
+        docker exec "$GATEWAY_CONTAINER" rm -f "$emit_path" 2>/dev/null || true
+
+        # Source the env vars and command emitted by the container.
+        # Output is trusted (our own container) — safe to eval.
+        eval "$env_output"
+
+        python3 "$HOST_RUNTIME" \
+            --compose-file "$COMPOSE_FILE" \
+            offer-pending-auth \
+            --selected-model "${ANTHROPIC_MODEL:-selected model}"
+
+        echo "  Launching Claude Code (${ANTHROPIC_MODEL:-unknown})..."
+        # shellcheck disable=SC2086
+        exec $LAUNCH_CMD
         ;;
     *)
         echo "  Unknown command: $CMD"

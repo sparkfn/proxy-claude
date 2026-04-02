@@ -16,9 +16,8 @@ log = logging.getLogger("litellm-cli.ollama")
 class OllamaProvider(BaseProvider):
     name = "ollama"
     display_name = "Ollama"
-    auth_types = []
-    env_vars = {}
     models = {}  # Dynamic — discovered at runtime
+    auth = {}    # No credentials needed
 
     DEFAULT_HOST = "http://localhost:11434"
     DEFAULT_DOCKER_HOST = "http://host.docker.internal:11434"
@@ -52,6 +51,19 @@ class OllamaProvider(BaseProvider):
         except (ValueError, AttributeError) as e:
             log.warning("Failed to parse OLLAMA_HOST '%s', using default: %s", env_host, e)
             return self.DEFAULT_DOCKER_HOST
+
+    def check_ready(self, env_data, auth_dir=None):
+        """Ollama is ready if the local server is reachable."""
+        import urllib.request
+        host = env_data.get("OLLAMA_HOST", "") or self.DEFAULT_HOST
+        try:
+            req = urllib.request.Request("%s/api/tags" % host, method="GET")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    return True, ""
+            return False, "Ollama returned status %d" % resp.status
+        except Exception:
+            return False, "Ollama not reachable at %s" % host
 
     def validate(self):
         host = self.OLLAMA_HOST
