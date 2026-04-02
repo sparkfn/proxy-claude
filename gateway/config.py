@@ -87,9 +87,13 @@ def _save_yaml(data):
     if os.path.exists(CONFIG_PATH):
         shutil.copy2(CONFIG_PATH, CONFIG_BACKUP)
         log.debug("Backed up config to %s", CONFIG_BACKUP)
-    _atomic_write(CONFIG_PATH, lambda f: yaml.dump(
-        data, f, default_flow_style=False, sort_keys=False
-    ))
+    try:
+        _atomic_write(CONFIG_PATH, lambda f: yaml.dump(
+            data, f, default_flow_style=False, sort_keys=False
+        ))
+    except OSError:
+        with open(CONFIG_PATH, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
     log.debug("Wrote config to %s", CONFIG_PATH)
 
 
@@ -234,10 +238,19 @@ def _read_env_lines():
 
 
 def _write_env_lines(lines):
-    """Backup then write .env atomically with restrictive permissions."""
+    """Write .env with restrictive permissions.
+
+    Tries atomic write (temp + rename) first. Falls back to in-place write
+    when running inside a container where .env is a bind-mounted file
+    (rename across mount boundaries fails with EBUSY/EXDEV).
+    """
     if os.path.exists(ENV_PATH):
         shutil.copy2(ENV_PATH, ENV_BACKUP)
-    _atomic_write(ENV_PATH, lambda f: f.writelines(lines))
+    try:
+        _atomic_write(ENV_PATH, lambda f: f.writelines(lines))
+    except OSError:
+        with open(ENV_PATH, "w") as f:
+            f.writelines(lines)
     os.chmod(ENV_PATH, stat.S_IRUSR | stat.S_IWUSR)
 
 
