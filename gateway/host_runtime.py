@@ -206,7 +206,7 @@ def _report_start_status(compose_file: str, gateway_url: str) -> int:
             print("  ⚠ LiteLLM is running, but the backend is not yet reachable.")
             print("    Check './proclaude.sh logs' if it does not finish initializing.")
 
-    # Check provider auth status inside the container
+    # Check provider auth status inside the container (timeout 5s — don't block startup)
     try:
         check_output = subprocess.check_output(
             [
@@ -225,6 +225,7 @@ def _report_start_status(compose_file: str, gateway_url: str) -> int:
             ],
             text=True,
             stderr=subprocess.DEVNULL,
+            timeout=5,
         )
         lines = [l.strip() for l in check_output.strip().splitlines() if l.strip()]
         if lines:
@@ -237,8 +238,8 @@ def _report_start_status(compose_file: str, gateway_url: str) -> int:
                     icon = "✓" if ready_str == "True" else "✗"
                     label = "ready" if ready_str == "True" else reason
                     print("    %s %-16s %-10s %s" % (icon, alias, display, label))
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass  # Container not ready yet; skip auth report
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        pass  # Container not ready or too slow; skip auth report
 
     return 0
 
