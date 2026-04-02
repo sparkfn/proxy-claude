@@ -13,12 +13,8 @@ services:
       - "host.docker.internal:host-gateway"
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     restart: always
-    healthcheck:
-      test: ["CMD", "python", "-c", "import http.client; c=http.client.HTTPConnection('localhost',4000,timeout=3); c.request('GET','/health/liveliness'); exit(0 if c.getresponse().status==200 else 1)"]
-      interval: 10s
-      timeout: 5s
-      retries: 60
-      start_period: 30s
+    # No healthcheck — gateway handles LiteLLM unavailability at runtime.
+    # A healthcheck here risks restart loops on slow starts or missing auth.
 
   gateway:
     build: ./gateway
