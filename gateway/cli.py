@@ -781,29 +781,31 @@ def cmd_launch_claude(provider_flag=None, model_flag=None, extra_args=None, thin
             model = {"alias": entry["alias"], "model": entry["model"], "provider": entry["provider"],
                      "litellm_params": {"model": entry["model"]}}
         else:
+            # Show all models in one numbered list — ready and not-ready
+            combined = ready + not_ready
             out("")
-            if ready:
-                out("  Ready:")
-                for i, e in enumerate(ready, 1):
+            for i, e in enumerate(combined, 1):
+                if e["ready"]:
                     out(f"    [{i}] {e['alias']:<16} {e['display_name']}")
-            if not_ready:
-                out("")
-                out("  Not ready:")
-                for e in not_ready:
-                    out(f"    {e['alias']:<18} {e['display_name']:<10}  {e['ready_reason']}")
+                else:
+                    out(f"    [{i}] {e['alias']:<16} {e['display_name']:<10}  {e['ready_reason']}")
             out("")
             out("  Choose [1]: ", end="")
             sys.stderr.flush()
             choice = input().strip() or "1"
             try:
                 idx = int(choice) - 1
-                if idx < 0 or idx >= len(ready):
+                if idx < 0 or idx >= len(combined):
                     out("  Invalid choice.")
                     sys.exit(1)
-                entry = ready[idx]
+                entry = combined[idx]
             except ValueError:
                 out("  Invalid choice.")
                 sys.exit(1)
+            if not entry["ready"]:
+                if not _launch_inline_setup(entry, out):
+                    sys.exit(1)
+                _credentials_changed = True
             model = {"alias": entry["alias"], "model": entry["model"], "provider": entry["provider"],
                      "litellm_params": {"model": entry["model"]}}
 
